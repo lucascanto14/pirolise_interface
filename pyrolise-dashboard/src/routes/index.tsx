@@ -14,8 +14,9 @@ import {
   AlertTriangle,
   CheckCircle2,
   CircleDot,
-  Wifi,
-  WifiOff,
+  Usb,
+  Unplug,
+  PlayCircle,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -48,24 +49,65 @@ export const Route = createFileRoute("/")({
   component: Dashboard,
 });
 
-// Endereço do servidor WebSocket do ESP32 (modo Access Point).
-// Pode ser trocado sem mexer no código criando um arquivo .env com VITE_ESP32_WS=ws://...
-const ESP32_WS_URL: string = import.meta.env.VITE_ESP32_WS ?? "ws://192.168.4.1:81";
-const RECONNECT_MS = 2000;
+// A ESP32 mestra fica ligada no computador pelo cabo USB. O site lê a saída serial
+// dela (a mesma que aparece no Monitor Serial da Arduino IDE) direto pelo navegador,
+// usando a Web Serial API (funciona no Chrome e no Edge do computador).
+const BAUD_RATE = 115200;
 
-// Unidades de cada sensor. Confirmem com o pessoal de cada escrava e ajustem aqui.
+// Unidades de cada sensor. Temperatura, tensão, corrente e energia vêm da escrava de
+// aquecimento (ID 0x200). As demais ainda não têm escrava; confirmem e ajustem aqui.
 const UNIDADES = {
   temperatura: "°C",
-  aquecimento: "%",
+  tensao: "V",
+  corrente: "A",
+  energia: "kWh",
   nitrogenio: "L/min",
   volumeGas: "L",
   biooleo: "ml",
   queima: "",
 };
 
-// Sensores que o ESP32 mestre envia (mesmos nomes do campo "sensor" no JSON)
 type SensorName = keyof typeof UNIDADES;
 const SENSORES = Object.keys(UNIDADES) as SensorName[];
+
+// Texto que a mestra imprime antes do ":" em cada linha -> sensor no site.
+// Ex.: "Temperatura do reator: 312.45 C" ou "Tensao: SEM LEITURA"
+const ROTULOS_SERIAL: Record<string, SensorName> = {
+  "Temperatura do reator": "temperatura",
+  Tensao: "tensao",
+  Corrente: "corrente",
+  "Energia acumulada": "energia",
+};
+
+type EventoSerial =
+  | { tipo: "valor"; sensor: SensorName; valor: number | null }
+  | { tipo: "escravaOffline" }
+  | { tipo: "erroCan" };
+
+// Interpreta uma linha da saída serial da mestra. Linhas desconhecidas são ignoradas.
+function lerLinha(linha: string): EventoSerial | null {
+  if (linha.includes("ATENCAO: sem comunicacao")) return { tipo: "escravaOffline" };
+  if (linha.includes("[CAN] Falha na inicializacao") || linha.includes("[CAN] Erro ao")) {
+    return { tipo: "erroCan" };
+  }
+  const m = linha.match(/^([^:]+):\s*(.+)$/);
+  if (!m) return null;
+  const sensor = ROTULOS_SERIAL[m[1].trim()];
+  if (!sensor) return null;
+  if (m[2].startsWith("SEM LEITURA")) return { tipo: "valor", sensor, valor: null };
+  const valor = parseFloat(m[2]);
+  return Number.isFinite(valor) ? { tipo: "valor", sensor, valor } : null;
+}
+
+// Tipos mínimos da Web Serial API (o TypeScript ainda não traz por padrão)
+type PortaSerial = {
+  open(opts: { baudRate: number }): Promise<void>;
+  close(): Promise<void>;
+  readable: ReadableStream<Uint8Array> | null;
+};
+type NavegadorComSerial = Navigator & {
+  serial?: { requestPort(): Promise<PortaSerial> };
+};
 
 type Point = { t: number; v: number };
 const MAX_POINTS = 40;
@@ -79,38 +121,39 @@ function fmt(n: number | null, d = 1) {
   return n === null ? "—" : n.toFixed(d);
 }
 
-type ConnStatus = "conectando" | "conectado" | "desconectado";
+type ConnStatus = "desconectado" | "conectando" | "conectado" | "simulacao";
 
 function Dashboard() {
-  const [running, setRunning] = useState(false);
   const [setpoint, setSetpoint] = useState(420);
   const [now, setNow] = useState(new Date());
   const [elapsed, setElapsed] = useState(0);
-  const [conn, setConn] = useState<ConnStatus>("conectando");
+  const [conn, setConn] = useState<ConnStatus>("desconectado");
+  const [erroConexao, setErroConexao] = useState<string | null>(null);
+  const [erroCan, setErroCan] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [serialSuportado, setSerialSuportado] = useState(true);
 
-  // telemetria recebida do ESP32 (null = ainda não chegou nenhum valor)
-  const [valores, setValores] = useState<Record<SensorName, number | null>>({
-    temperatura: null,
-    aquecimento: null,
-    nitrogenio: null,
-    volumeGas: null,
-    biooleo: null,
-    queima: null,
-  });
-  const [series, setSeries] = useState<Record<SensorName, Point[]>>({
-    temperatura: [],
-    aquecimento: [],
-    nitrogenio: [],
-    volumeGas: [],
-    biooleo: [],
-    queima: [],
-  });
+  // telemetria recebida (null = sem leitura ou ainda não chegou)
+  const [valores, setValores] = useState(
+    () => Object.fromEntries(SENSORES.map((s) => [s, null])) as Record<SensorName, number | null>,
+  );
+  const [series, setSeries] = useState(
+    () => Object.fromEntries(SENSORES.map((s) => [s, [] as Point[]])) as Record<SensorName, Point[]>,
+  );
+  // comunicação entre a mestra e a escrava de aquecimento (null = ainda não informado)
+  const [aquecimentoOnline, setAquecimentoOnline] = useState<boolean | null>(null);
 
-  const socketRef = useRef<WebSocket | null>(null);
+  const portaRef = useRef<PortaSerial | null>(null);
+  const leitorRef = useRef<ReadableStreamDefaultReader<string> | null>(null);
+  const simulacaoRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startRef = useRef(Date.now());
-  // último setpoint confirmado pelo ESP32 (para não reenviar o que veio dele)
-  const espSetpointRef = useRef<number | null>(null);
+
+  const online = conn === "conectado" || conn === "simulacao";
+
+  // Web Serial só existe no Chrome/Edge (verificado no navegador, não no servidor)
+  useEffect(() => {
+    setSerialSuportado("serial" in navigator);
+  }, []);
 
   // relógio
   useEffect(() => {
@@ -118,89 +161,157 @@ function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // tempo de processo
+  // tempo de monitoramento (enquanto conectado)
   useEffect(() => {
-    if (!running) return;
+    if (!online) return;
     const id = setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => clearInterval(id);
-  }, [running]);
+  }, [online]);
 
-  // conexão WebSocket com o ESP32, com reconexão automática
-  useEffect(() => {
-    let socket: WebSocket | null = null;
-    let retry: ReturnType<typeof setTimeout> | undefined;
-    let closed = false;
+  const processarLinha = (linha: string) => {
+    const evento = lerLinha(linha.trim());
+    if (!evento) return;
 
-    const connect = () => {
-      setConn("conectando");
-      socket = new WebSocket(ESP32_WS_URL);
-      socketRef.current = socket;
+    if (evento.tipo === "escravaOffline") {
+      setAquecimentoOnline(false);
+      return;
+    }
+    if (evento.tipo === "erroCan") {
+      setErroCan(true);
+      return;
+    }
 
-      socket.onopen = () => setConn("conectado");
-
-      socket.onmessage = (evento) => {
-        let pacote: { sensor?: string; valor?: unknown };
-        try {
-          pacote = JSON.parse(evento.data);
-        } catch {
-          console.warn("Mensagem inválida do ESP32:", evento.data);
-          return;
-        }
-        const valor = Number(pacote.valor);
-        if (!Number.isFinite(valor)) return;
-
-        // confirmações de comando enviadas pelo ESP32
-        if (pacote.sensor === "estado") {
-          setRunning(valor === 1);
-          return;
-        }
-        if (pacote.sensor === "setpoint") {
-          espSetpointRef.current = valor;
-          setSetpoint(valor);
-          return;
-        }
-
-        if (!SENSORES.includes(pacote.sensor as SensorName)) return;
-        const nome = pacote.sensor as SensorName;
-        const t = Math.round((Date.now() - startRef.current) / 1000);
-        setValores((v) => ({ ...v, [nome]: valor }));
-        setSeries((s) => ({ ...s, [nome]: pushSeries(s[nome], valor, t) }));
-        setLastUpdate(new Date());
-      };
-
-      socket.onclose = () => {
-        socketRef.current = null;
-        setConn("desconectado");
-        if (!closed) retry = setTimeout(connect, RECONNECT_MS);
-      };
-    };
-
-    connect();
-    return () => {
-      closed = true;
-      clearTimeout(retry);
-      socket?.close();
-    };
-  }, []);
-
-  const enviar = (msg: object) => {
-    const socket = socketRef.current;
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+    const { sensor, valor } = evento;
+    setAquecimentoOnline(true);
+    setValores((v) => ({ ...v, [sensor]: valor }));
+    if (valor !== null) {
+      const t = Math.round((Date.now() - startRef.current) / 1000);
+      setSeries((s) => ({ ...s, [sensor]: pushSeries(s[sensor], valor, t) }));
+    }
+    setLastUpdate(new Date());
   };
 
-  // O estado só muda na tela quando o ESP32 confirma ({"sensor":"estado",...})
-  const toggleRunning = () => enviar({ cmd: running ? "desligar" : "ligar" });
+  const pararSimulacao = () => {
+    if (simulacaoRef.current) clearInterval(simulacaoRef.current);
+    simulacaoRef.current = null;
+  };
 
-  // envia o setpoint 300 ms depois que o usuário para de mexer no slider
-  // (só depois que o ESP32 informou o setpoint atual dele, para não sobrescrevê-lo ao abrir a página)
+  const desconectar = async () => {
+    pararSimulacao();
+    try {
+      await leitorRef.current?.cancel();
+    } catch {
+      /* já estava fechado */
+    }
+    leitorRef.current = null;
+    try {
+      await portaRef.current?.close();
+    } catch {
+      /* já estava fechada */
+    }
+    portaRef.current = null;
+    setConn("desconectado");
+  };
+
+  const conectarSerial = async () => {
+    const serial = (navigator as NavegadorComSerial).serial;
+    if (!serial) {
+      setErroConexao("Este navegador não acessa a porta USB. Abra o site no Chrome ou no Edge do computador.");
+      return;
+    }
+    setErroConexao(null);
+    setErroCan(false);
+    pararSimulacao();
+
+    let porta: PortaSerial;
+    try {
+      porta = await serial.requestPort(); // o navegador abre a lista de portas
+    } catch {
+      return; // usuário fechou a janela sem escolher
+    }
+
+    try {
+      setConn("conectando");
+      await porta.open({ baudRate: BAUD_RATE });
+    } catch {
+      setConn("desconectado");
+      setErroConexao(
+        "Não foi possível abrir a porta. Feche o Monitor Serial da Arduino IDE (ou outro programa usando a porta) e tente de novo.",
+      );
+      return;
+    }
+    portaRef.current = porta;
+    setConn("conectado");
+
+    // lê o texto da serial e separa em linhas
+    const leitor = porta.readable!.pipeThrough(new TextDecoderStream()).getReader();
+    leitorRef.current = leitor;
+    let buffer = "";
+    try {
+      for (;;) {
+        const { value, done } = await leitor.read();
+        if (done) break;
+        buffer += value;
+        const linhas = buffer.split("\n");
+        buffer = linhas.pop() ?? "";
+        linhas.forEach(processarLinha);
+      }
+    } catch {
+      setErroConexao("A conexão USB com a ESP32 caiu. Confira o cabo e clique em Conectar de novo.");
+    }
+    leitor.releaseLock();
+    try {
+      await porta.close();
+    } catch {
+      /* já estava fechada */
+    }
+    if (portaRef.current === porta) {
+      portaRef.current = null;
+      leitorRef.current = null;
+      setConn("desconectado");
+    }
+  };
+
+  // a simulação lê o setpoint atual sem reiniciar o intervalo
+  const setpointRef = useRef(setpoint);
   useEffect(() => {
-    if (espSetpointRef.current === null || setpoint === espSetpointRef.current) return;
-    const id = setTimeout(() => enviar({ cmd: "setpoint", valor: setpoint }), 300);
-    return () => clearTimeout(id);
+    setpointRef.current = setpoint;
   }, [setpoint]);
 
-  const online = conn === "conectado";
+  // Modo simulação: gera as mesmas linhas que a mestra imprime, para testar sem a placa
+  const iniciarSimulacao = async () => {
+    await desconectar();
+    setErroConexao(null);
+    setErroCan(false);
+    setConn("simulacao");
+    let temperatura = 25;
+    let energia = 0;
+    let t = 0;
+    simulacaoRef.current = setInterval(() => {
+      t += 1;
+      temperatura += (setpointRef.current - temperatura) * 0.05 + (Math.random() - 0.5) * 3;
+      const tensao = 218 + Math.random() * 4;
+      const corrente = temperatura < setpointRef.current - 5 ? 9 + Math.sin(t / 7) + Math.random() * 0.3 : 3;
+      energia += (tensao * corrente) / 3_600_000;
+      processarLinha("========== AQUECIMENTO / MEDIDAS ==========");
+      processarLinha(`Temperatura do reator: ${temperatura.toFixed(2)} C`);
+      processarLinha(`Tensao: ${tensao.toFixed(1)} V`);
+      processarLinha(`Corrente: ${corrente.toFixed(3)} A`);
+      if (t % 5 === 0) processarLinha(`Energia acumulada: ${energia.toFixed(3)} kWh`);
+    }, 1000);
+  };
+
+  // fecha a porta e para a simulação ao sair da página
+  useEffect(() => {
+    return () => {
+      void desconectar();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const temp = valores.temperatura;
+  const potencia =
+    valores.tensao !== null && valores.corrente !== null ? valores.tensao * valores.corrente : null;
 
   const clock = useMemo(
     () =>
@@ -250,7 +361,6 @@ function Dashboard() {
 
         <div className="flex flex-wrap items-center gap-3">
           <ConnBadge status={conn} />
-          <StatusBadge running={running} />
           <div className="rounded-xl border border-border bg-background/60 px-4 py-2">
             <div className="text-mono text-2xl leading-none text-neon">{clock}</div>
             <div className="mt-1 text-[10px] uppercase tracking-widest text-muted-foreground">
@@ -260,73 +370,101 @@ function Dashboard() {
         </div>
       </header>
 
-      {/* CONTROL PANEL */}
+      {/* CONEXÃO + SETPOINT */}
       <section className="mb-6 grid gap-4 lg:grid-cols-[1.2fr_1fr]">
         <div className="rounded-2xl panel-grad border border-border p-5">
-          <SectionTitle icon={<Power className="h-4 w-4" />} label="Painel de Controle Central" />
-          <div className="mt-4 grid gap-5 md:grid-cols-[auto_1fr] md:items-center">
-            <button
-              onClick={toggleRunning}
-              disabled={!online}
-              title={online ? undefined : "Sem conexão com o ESP32"}
-              className={`group relative h-32 w-32 rounded-full border-2 transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
-                running
-                  ? "border-neon glow-neon"
-                  : "border-border hover:border-muted-foreground"
-              }`}
-            >
-              <div
-                className={`absolute inset-2 rounded-full ${
-                  running ? "bg-neon/15" : "bg-secondary"
-                } grid place-items-center transition-colors`}
+          <SectionTitle icon={<Usb className="h-4 w-4" />} label="Conexão com a ESP32 Mestra" />
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            {online ? (
+              <button
+                onClick={() => void desconectar()}
+                className="inline-flex items-center gap-2 rounded-xl border border-border bg-background/40 px-5 py-3 text-sm font-semibold hover:border-danger hover:text-danger transition"
               >
-                <Power
-                  className={`h-12 w-12 ${running ? "text-neon" : "text-muted-foreground"}`}
-                />
-              </div>
-              <span className="absolute -bottom-7 left-1/2 -translate-x-1/2 text-xs font-semibold tracking-widest text-muted-foreground">
-                {running ? "DESLIGAR" : "LIGAR"}
-              </span>
-            </button>
-
-            <div className="mt-6 md:mt-0">
-              <div className="flex items-baseline justify-between">
-                <label className="text-xs uppercase tracking-widest text-muted-foreground">
-                  Setpoint · Temperatura do Reator
-                </label>
-                <span className="text-mono text-3xl text-neon">
-                  {setpoint}
-                  <span className="ml-1 text-sm text-muted-foreground">°C</span>
-                </span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={600}
-                step={5}
-                value={setpoint}
-                disabled={!online}
-                onChange={(e) => setSetpoint(Number(e.target.value))}
-                className="mt-3 w-full accent-[color:var(--neon)] disabled:opacity-50"
-              />
-              <div className="mt-1 flex justify-between text-[10px] text-muted-foreground text-mono">
-                <span>0°C</span>
-                <span>300°C</span>
-                <span>600°C</span>
-              </div>
-              <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs">
-                {[300, 420, 550].map((p) => (
-                  <button
-                    key={p}
-                    onClick={() => setSetpoint(p)}
-                    disabled={!online}
-                    className="rounded-lg border border-border bg-background/40 py-2 text-mono hover:border-neon hover:text-neon transition disabled:opacity-50 disabled:hover:border-border disabled:hover:text-inherit"
-                  >
-                    {p}°C
-                  </button>
-                ))}
-              </div>
+                <Unplug className="h-4 w-4" />
+                {conn === "simulacao" ? "Parar simulação" : "Desconectar"}
+              </button>
+            ) : (
+              <button
+                onClick={() => void conectarSerial()}
+                disabled={conn === "conectando"}
+                className="inline-flex items-center gap-2 rounded-xl border border-neon bg-neon/15 px-5 py-3 text-sm font-semibold text-neon glow-neon transition disabled:opacity-50"
+              >
+                <Usb className="h-4 w-4" />
+                Conectar ESP32 (USB)
+              </button>
+            )}
+            {!online && (
+              <button
+                onClick={() => void iniciarSimulacao()}
+                className="inline-flex items-center gap-2 rounded-xl border border-border bg-background/40 px-5 py-3 text-sm hover:border-cyan hover:text-cyan transition"
+              >
+                <PlayCircle className="h-4 w-4" />
+                Modo simulação
+              </button>
+            )}
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            Ligue a ESP32 mestra no computador pelo cabo USB, feche o Monitor Serial da Arduino IDE e
+            clique em Conectar. O navegador vai pedir para escolher a porta (COM). Funciona no Chrome
+            e no Edge.
+          </p>
+          {!serialSuportado && (
+            <p className="mt-2 text-xs text-warn">
+              Este navegador não acessa a porta USB. Use o Chrome ou o Edge do computador.
+            </p>
+          )}
+          {erroConexao && (
+            <div className="mt-3 flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {erroConexao}
             </div>
+          )}
+          {erroCan && (
+            <div className="mt-3 flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              A mestra informou falha ao iniciar o CAN. Verifique os pinos e o transceiver.
+            </div>
+          )}
+
+          <div className="mt-6 border-t border-border pt-5">
+            <div className="flex items-baseline justify-between">
+              <label className="text-xs uppercase tracking-widest text-muted-foreground">
+                Setpoint · Referência no gráfico
+              </label>
+              <span className="text-mono text-3xl text-neon">
+                {setpoint}
+                <span className="ml-1 text-sm text-muted-foreground">°C</span>
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={600}
+              step={5}
+              value={setpoint}
+              onChange={(e) => setSetpoint(Number(e.target.value))}
+              className="mt-3 w-full accent-[color:var(--neon)]"
+            />
+            <div className="mt-1 flex justify-between text-[10px] text-muted-foreground text-mono">
+              <span>0°C</span>
+              <span>300°C</span>
+              <span>600°C</span>
+            </div>
+            <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs">
+              {[300, 420, 550].map((p) => (
+                <button
+                  key={p}
+                  onClick={() => setSetpoint(p)}
+                  className="rounded-lg border border-border bg-background/40 py-2 text-mono hover:border-neon hover:text-neon transition"
+                >
+                  {p}°C
+                </button>
+              ))}
+            </div>
+            <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+              <Power className="h-3.5 w-3.5" />
+              A mestra atual só envia leituras. Ligar/desligar e o setpoint ainda não são enviados ao reator.
+            </p>
           </div>
         </div>
 
@@ -334,7 +472,7 @@ function Dashboard() {
           <SectionTitle icon={<Activity className="h-4 w-4" />} label="Telemetria Crítica" />
           <div className="mt-4 grid grid-cols-2 gap-3">
             <Metric icon={<Thermometer className="h-4 w-4 text-neon" />} label="Temp. Reator" value={fmt(temp, 0)} unit={UNIDADES.temperatura} tone="neon" compact />
-            <Metric icon={<Zap className="h-4 w-4 text-warn" />} label="Aquecimento" value={fmt(valores.aquecimento, 1)} unit={UNIDADES.aquecimento} tone="warn" compact />
+            <Metric icon={<Zap className="h-4 w-4 text-warn" />} label="Potência" value={fmt(potencia, 0)} unit="W" tone="warn" compact />
             <Metric icon={<Wind className="h-4 w-4 text-cyan" />} label="Nitrogênio" value={fmt(valores.nitrogenio, 2)} unit={UNIDADES.nitrogenio} tone="cyan" compact />
             <Metric icon={<Droplets className="h-4 w-4 text-warn" />} label="Bio-óleo" value={fmt(valores.biooleo, 2)} unit={UNIDADES.biooleo} tone="warn" compact />
           </div>
@@ -421,12 +559,40 @@ function Dashboard() {
           icon={<Zap className="h-4 w-4" />}
           className="md:col-span-2"
         >
+          {aquecimentoOnline === false && (
+            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+              <AlertTriangle className="h-4 w-4" />
+              Sem comunicação com a escrava de aquecimento (últimos valores mostrados)
+            </div>
+          )}
           <div className="grid gap-3 sm:grid-cols-3">
             <Metric
               icon={<Zap className="h-4 w-4 text-warn" />}
-              label="Aquecimento"
-              value={fmt(valores.aquecimento, 1)}
-              unit={UNIDADES.aquecimento}
+              label="Tensão"
+              value={fmt(valores.tensao, 1)}
+              unit={UNIDADES.tensao}
+              compact
+            />
+            <Metric
+              icon={<Zap className="h-4 w-4 text-warn" />}
+              label="Corrente"
+              value={fmt(valores.corrente, 3)}
+              unit={UNIDADES.corrente}
+              compact
+            />
+            <Metric
+              icon={<Zap className="h-4 w-4 text-warn" />}
+              label="Potência"
+              value={fmt(potencia, 0)}
+              unit="W"
+              compact
+              tone="warn"
+            />
+            <Metric
+              icon={<Activity className="h-4 w-4 text-cyan" />}
+              label="Energia Acumulada"
+              value={fmt(valores.energia, 3)}
+              unit={UNIDADES.energia}
               compact
             />
             <Metric
@@ -439,7 +605,7 @@ function Dashboard() {
             />
             <Metric
               icon={<Timer className="h-4 w-4 text-cyan" />}
-              label="Tempo Processo"
+              label="Tempo Monitorando"
               value={elapsedStr}
               unit=""
               compact
@@ -546,11 +712,11 @@ function Dashboard() {
 
       <footer className="mt-8 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
         <span>
-          Telemetria ao vivo · ESP32 em {ESP32_WS_URL}
+          {conn === "simulacao" ? "Modo simulação (dados gerados no navegador)" : "Telemetria ao vivo · ESP32 mestra via USB"}
           {lastUpdate &&
             ` · último dado às ${lastUpdate.toLocaleTimeString("pt-BR")}`}
         </span>
-        <span className="text-mono">PIRO-RICE · v1.1</span>
+        <span className="text-mono">PIRO-RICE · v1.2</span>
       </footer>
     </main>
   );
@@ -559,53 +725,22 @@ function Dashboard() {
 /* ----------------- subcomponents ----------------- */
 
 function ConnBadge({ status }: { status: ConnStatus }) {
-  const online = status === "conectado";
+  const ok = status === "conectado" || status === "simulacao";
   return (
     <div
       className={`flex items-center gap-2 rounded-xl border px-4 py-2 ${
-        online
-          ? "border-cyan/40 bg-cyan/10 text-cyan"
-          : "border-warn/40 bg-warn/10 text-warn"
+        ok ? "border-cyan/40 bg-cyan/10 text-cyan" : "border-warn/40 bg-warn/10 text-warn"
       }`}
     >
-      {online ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+      {ok ? <Usb className="h-4 w-4" /> : <Unplug className="h-4 w-4" />}
       <span className="text-xs font-bold tracking-[0.18em]">
         {status === "conectado"
-          ? "ESP32 ONLINE"
-          : status === "conectando"
-            ? "CONECTANDO..."
-            : "ESP32 OFFLINE"}
-      </span>
-    </div>
-  );
-}
-
-
-function StatusBadge({ running }: { running: boolean }) {
-  return (
-    <div
-      className={`flex items-center gap-2 rounded-xl border px-4 py-2 ${
-        running
-          ? "border-neon/40 bg-neon/10 text-neon glow-neon"
-          : "border-danger/40 bg-danger/10 text-danger glow-danger"
-      }`}
-    >
-      <span
-        className={`relative flex h-2.5 w-2.5 ${running ? "" : ""}`}
-      >
-        <span
-          className={`absolute inset-0 rounded-full ${
-            running ? "bg-neon" : "bg-danger"
-          } animate-ping opacity-75`}
-        />
-        <span
-          className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
-            running ? "bg-neon" : "bg-danger"
-          }`}
-        />
-      </span>
-      <span className="text-xs font-bold tracking-[0.18em]">
-        {running ? "OPERANDO" : "DESLIGADO"}
+          ? "ESP32 CONECTADA"
+          : status === "simulacao"
+            ? "SIMULAÇÃO"
+            : status === "conectando"
+              ? "CONECTANDO..."
+              : "ESP32 DESCONECTADA"}
       </span>
     </div>
   );
