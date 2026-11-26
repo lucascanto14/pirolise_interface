@@ -54,49 +54,122 @@ export const Route = createFileRoute("/")({
 // usando a Web Serial API (funciona no Chrome e no Edge do computador).
 const BAUD_RATE = 115200;
 
-// Unidades de cada sensor. Temperatura, tensão, corrente e energia vêm da escrava de
-// aquecimento (ID 0x200). As demais ainda não têm escrava; confirmem e ajustem aqui.
+// Unidades de cada sensor, agrupadas pela escrava que envia o dado.
+//   Temperatura (ID 0x100): T1 a T10 (MAX6675) e DHT22
+//   Aquecimento (ID 0x200): temperatura do reator, tensão, corrente e energia
+//   Queimagas   (ID 0x600): temperatura da água, presença de gás e de chama, calor
+// Nitrogênio, volume do gás e bio-óleo ainda não têm escrava (aparecem como "—").
 const UNIDADES = {
+  t1: "°C",
+  t2: "°C",
+  t3: "°C",
+  t4: "°C",
+  t5: "°C",
+  t6: "°C",
+  t7: "°C",
+  t8: "°C",
+  t9: "°C",
+  t10: "°C",
+  dht22: "°C",
   temperatura: "°C",
   tensao: "V",
   corrente: "A",
   energia: "kWh",
+  temperaturaAgua: "°C",
+  presencaGas: "",
+  presencaChama: "",
+  calor: "J",
   nitrogenio: "L/min",
   volumeGas: "L",
   biooleo: "ml",
-  queima: "",
 };
 
 type SensorName = keyof typeof UNIDADES;
 const SENSORES = Object.keys(UNIDADES) as SensorName[];
 
-// Texto que a mestra imprime antes do ":" em cada linha -> sensor no site.
-// Ex.: "Temperatura do reator: 312.45 C" ou "Tensao: SEM LEITURA"
-const ROTULOS_SERIAL: Record<string, SensorName> = {
-  "Temperatura do reator": "temperatura",
-  Tensao: "tensao",
-  Corrente: "corrente",
-  "Energia acumulada": "energia",
+const TERMOPARES: { sensor: SensorName; rotulo: string }[] = [
+  ...Array.from({ length: 10 }, (_, i) => ({
+    sensor: `t${i + 1}` as SensorName,
+    rotulo: `T${i + 1}`,
+  })),
+  { sensor: "dht22", rotulo: "DHT22" },
+];
+
+type Escrava = "temperatura" | "aquecimento" | "queimagas";
+
+// Texto que a mestra imprime antes do ":" em cada linha -> sensor no site e escrava de origem.
+// Ex.: "T3: 251.25 C", "Tensao: SEM LEITURA", "Presenca de chama: Yes", "Calor: 1200 J"
+const ROTULOS_SERIAL: Record<string, { sensor: SensorName; escrava: Escrava }> = {
+  ...Object.fromEntries(
+    TERMOPARES.map(({ sensor, rotulo }) => [rotulo, { sensor, escrava: "temperatura" as Escrava }]),
+  ),
+  "Temperatura do reator": { sensor: "temperatura", escrava: "aquecimento" },
+  Tensao: { sensor: "tensao", escrava: "aquecimento" },
+  Corrente: { sensor: "corrente", escrava: "aquecimento" },
+  "Energia acumulada": { sensor: "energia", escrava: "aquecimento" },
+  "Temperatura da agua": { sensor: "temperaturaAgua", escrava: "queimagas" },
+  "Presenca de gas": { sensor: "presencaGas", escrava: "queimagas" },
+  "Presenca de chama": { sensor: "presencaChama", escrava: "queimagas" },
+  Calor: { sensor: "calor", escrava: "queimagas" },
+};
+
+// Aviso de timeout da mestra -> escrava. Ex.: "[CAN] ATENCAO: sem comunicacao com a escrava Temperatura (ID 0x100)."
+const ID_ESCRAVA: Record<string, Escrava> = {
+  "0x100": "temperatura",
+  "0x200": "aquecimento",
+  "0x600": "queimagas",
 };
 
 type EventoSerial =
-  | { tipo: "valor"; sensor: SensorName; valor: number | null }
-  | { tipo: "escravaOffline" }
-  | { tipo: "erroCan" };
+  | { tipo: "valor"; sensor: SensorName; escrava: Escrava; valor: number | null }
+  | { tipo: "escravaOffline"; escrava: Escrava }
+  | { tipo: "erroCan" }
+  | { tipo: "barramento"; estado: number; txErr: number; rxErr: number }
+  | { tipo: "tx"; resultado: string }
+  | { tipo: "rx"; id: string; dado: number };
+
+// Estado do driver TWAI impresso pela mestra em "estado=N txErr=A rxErr=B"
+const ESTADOS_TWAI: Record<number, { texto: string; ok: boolean }> = {
+  0: { texto: "PARADO", ok: false },
+  1: { texto: "OK", ok: true },
+  2: { texto: "BUS-OFF", ok: false },
+  3: { texto: "RECUPERANDO", ok: false },
+};
 
 // Interpreta uma linha da saída serial da mestra. Linhas desconhecidas são ignoradas.
 function lerLinha(linha: string): EventoSerial | null {
-  if (linha.includes("ATENCAO: sem comunicacao")) return { tipo: "escravaOffline" };
-  if (linha.includes("[CAN] Falha na inicializacao") || linha.includes("[CAN] Erro ao")) {
+  if (linha.includes("ATENCAO: sem comunicacao")) {
+    const id = linha.match(/ID (0x[0-9A-Fa-f]+)/)?.[1]?.toLowerCase();
+    const escrava = id ? ID_ESCRAVA[id] : undefined;
+    return escrava ? { tipo: "escravaOffline", escrava } : null;
+  }
+  if (
+    linha.includes("[CAN] Falha na inicializacao") ||
+    linha.includes("[CAN] Erro ao") ||
+    linha.includes("Falha ao iniciar TWAI")
+  ) {
     return { tipo: "erroCan" };
   }
+  // Teste do barramento: "estado=1 txErr=0 rxErr=0", "TX: ESP_OK", "RX id=0x123 dado=42"
+  const st = linha.match(/^estado=(\d+)\s+txErr=(\d+)\s+rxErr=(\d+)/);
+  if (st) return { tipo: "barramento", estado: +st[1], txErr: +st[2], rxErr: +st[3] };
+  const tx = linha.match(/^TX:\s*(\S+)/);
+  if (tx) return { tipo: "tx", resultado: tx[1] };
+  const rx = linha.match(/^RX id=(0x[0-9A-Fa-f]+)\s+dado=(-?\d+)/);
+  if (rx) return { tipo: "rx", id: rx[1].toUpperCase().replace("0X", "0x"), dado: +rx[2] };
   const m = linha.match(/^([^:]+):\s*(.+)$/);
   if (!m) return null;
-  const sensor = ROTULOS_SERIAL[m[1].trim()];
-  if (!sensor) return null;
-  if (m[2].startsWith("SEM LEITURA")) return { tipo: "valor", sensor, valor: null };
-  const valor = parseFloat(m[2]);
-  return Number.isFinite(valor) ? { tipo: "valor", sensor, valor } : null;
+  const destino = ROTULOS_SERIAL[m[1].trim()];
+  if (!destino) return null;
+  const texto = m[2].trim();
+  // "Yes"/"No" da Queimagas viram 1/0; "SEM LEITURA" e "DADO INVALIDO" ficam sem valor
+  if (texto === "Yes") return { tipo: "valor", ...destino, valor: 1 };
+  if (texto === "No") return { tipo: "valor", ...destino, valor: 0 };
+  if (texto.startsWith("SEM LEITURA") || texto.startsWith("DADO INVALIDO")) {
+    return { tipo: "valor", ...destino, valor: null };
+  }
+  const valor = parseFloat(texto);
+  return Number.isFinite(valor) ? { tipo: "valor", ...destino, valor } : null;
 }
 
 // Tipos mínimos da Web Serial API (o TypeScript ainda não traz por padrão)
@@ -121,6 +194,10 @@ function fmt(n: number | null, d = 1) {
   return n === null ? "—" : n.toFixed(d);
 }
 
+function simNao(n: number | null) {
+  return n === null ? "—" : n === 1 ? "SIM" : "NÃO";
+}
+
 type ConnStatus = "desconectado" | "conectando" | "conectado" | "simulacao";
 
 function Dashboard() {
@@ -130,6 +207,14 @@ function Dashboard() {
   const [conn, setConn] = useState<ConnStatus>("desconectado");
   const [erroConexao, setErroConexao] = useState<string | null>(null);
   const [erroCan, setErroCan] = useState(false);
+  // teste do barramento CAN (linhas TX / RX / estado da mestra)
+  const [barramento, setBarramento] = useState<{
+    estado: number;
+    txErr: number;
+    rxErr: number;
+  } | null>(null);
+  const [ultimoTx, setUltimoTx] = useState<string | null>(null);
+  const [ultimoRx, setUltimoRx] = useState<{ id: string; dado: number } | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [serialSuportado, setSerialSuportado] = useState(true);
 
@@ -138,10 +223,15 @@ function Dashboard() {
     () => Object.fromEntries(SENSORES.map((s) => [s, null])) as Record<SensorName, number | null>,
   );
   const [series, setSeries] = useState(
-    () => Object.fromEntries(SENSORES.map((s) => [s, [] as Point[]])) as Record<SensorName, Point[]>,
+    () =>
+      Object.fromEntries(SENSORES.map((s) => [s, [] as Point[]])) as Record<SensorName, Point[]>,
   );
-  // comunicação entre a mestra e a escrava de aquecimento (null = ainda não informado)
-  const [aquecimentoOnline, setAquecimentoOnline] = useState<boolean | null>(null);
+  // comunicação entre a mestra e cada escrava (null = ainda não informado)
+  const [escravaOnline, setEscravaOnline] = useState<Record<Escrava, boolean | null>>({
+    temperatura: null,
+    aquecimento: null,
+    queimagas: null,
+  });
 
   const portaRef = useRef<PortaSerial | null>(null);
   const leitorRef = useRef<ReadableStreamDefaultReader<string> | null>(null);
@@ -173,16 +263,29 @@ function Dashboard() {
     if (!evento) return;
 
     if (evento.tipo === "escravaOffline") {
-      setAquecimentoOnline(false);
+      setEscravaOnline((e) => ({ ...e, [evento.escrava]: false }));
       return;
     }
     if (evento.tipo === "erroCan") {
       setErroCan(true);
       return;
     }
+    if (evento.tipo === "barramento") {
+      const { estado, txErr, rxErr } = evento;
+      setBarramento({ estado, txErr, rxErr });
+      return;
+    }
+    if (evento.tipo === "tx") {
+      setUltimoTx(evento.resultado);
+      return;
+    }
+    if (evento.tipo === "rx") {
+      setUltimoRx({ id: evento.id, dado: evento.dado });
+      return;
+    }
 
-    const { sensor, valor } = evento;
-    setAquecimentoOnline(true);
+    const { sensor, escrava, valor } = evento;
+    setEscravaOnline((e) => (e[escrava] ? e : { ...e, [escrava]: true }));
     setValores((v) => ({ ...v, [sensor]: valor }));
     if (valor !== null) {
       const t = Math.round((Date.now() - startRef.current) / 1000);
@@ -216,11 +319,16 @@ function Dashboard() {
   const conectarSerial = async () => {
     const serial = (navigator as NavegadorComSerial).serial;
     if (!serial) {
-      setErroConexao("Este navegador não acessa a porta USB. Abra o site no Chrome ou no Edge do computador.");
+      setErroConexao(
+        "Este navegador não acessa a porta USB. Abra o site no Chrome ou no Edge do computador.",
+      );
       return;
     }
     setErroConexao(null);
     setErroCan(false);
+    setBarramento(null);
+    setUltimoTx(null);
+    setUltimoRx(null);
     pararSimulacao();
 
     let porta: PortaSerial;
@@ -244,7 +352,11 @@ function Dashboard() {
     setConn("conectado");
 
     // lê o texto da serial e separa em linhas
-    const leitor = porta.readable!.pipeThrough(new TextDecoderStream()).getReader();
+    const leitor = porta
+      .readable!.pipeThrough(
+        new TextDecoderStream() as unknown as ReadableWritablePair<string, Uint8Array>,
+      )
+      .getReader();
     leitorRef.current = leitor;
     let buffer = "";
     try {
@@ -257,7 +369,9 @@ function Dashboard() {
         linhas.forEach(processarLinha);
       }
     } catch {
-      setErroConexao("A conexão USB com a ESP32 caiu. Confira o cabo e clique em Conectar de novo.");
+      setErroConexao(
+        "A conexão USB com a ESP32 caiu. Confira o cabo e clique em Conectar de novo.",
+      );
     }
     leitor.releaseLock();
     try {
@@ -283,21 +397,61 @@ function Dashboard() {
     await desconectar();
     setErroConexao(null);
     setErroCan(false);
+    setBarramento(null);
+    setUltimoTx(null);
+    setUltimoRx(null);
     setConn("simulacao");
     let temperatura = 25;
     let energia = 0;
+    let calor = 0;
+    let agua = 24;
     let t = 0;
+    const linhaTemp = (rotulo: string, v: number | null) =>
+      processarLinha(v === null ? `${rotulo}: SEM LEITURA` : `${rotulo}: ${v.toFixed(2)} C`);
     simulacaoRef.current = setInterval(() => {
       t += 1;
-      temperatura += (setpointRef.current - temperatura) * 0.05 + (Math.random() - 0.5) * 3;
+      const sp = setpointRef.current;
+      temperatura += (sp - temperatura) * 0.05 + (Math.random() - 0.5) * 3;
+
+      // Escrava Aquecimento (ID 0x200)
       const tensao = 218 + Math.random() * 4;
-      const corrente = temperatura < setpointRef.current - 5 ? 9 + Math.sin(t / 7) + Math.random() * 0.3 : 3;
+      const corrente = temperatura < sp - 5 ? 9 + Math.sin(t / 7) + Math.random() * 0.3 : 3;
       energia += (tensao * corrente) / 3_600_000;
       processarLinha("========== AQUECIMENTO / MEDIDAS ==========");
       processarLinha(`Temperatura do reator: ${temperatura.toFixed(2)} C`);
       processarLinha(`Tensao: ${tensao.toFixed(1)} V`);
       processarLinha(`Corrente: ${corrente.toFixed(3)} A`);
       if (t % 5 === 0) processarLinha(`Energia acumulada: ${energia.toFixed(3)} kWh`);
+
+      // Escrava Temperatura (ID 0x100): um quadro por segundo, em rodízio
+      const quadro = ((t - 1) % 4) + 1;
+      processarLinha(`========== TEMPERATURAS / QUADRO ${quadro} ==========`);
+      const perfil = (i: number) =>
+        25 + (temperatura - 25) * (1 - i * 0.08) + (Math.random() - 0.5) * 2;
+      if (quadro < 4) {
+        for (let i = 0; i < 3; i++) {
+          const n = (quadro - 1) * 3 + i + 1;
+          linhaTemp(`T${n}`, n === 8 ? null : perfil(n - 1)); // T8 simula termopar sem leitura
+        }
+      } else {
+        linhaTemp("T10", perfil(9));
+        linhaTemp("DHT22", 27 + Math.random());
+      }
+
+      // Escrava Queimagas (ID 0x600)
+      const quente = temperatura > 300;
+      agua += ((quente ? 60 : 25) - agua) * 0.02;
+      calor += quente ? 800 + Math.round(Math.random() * 100) : 0;
+      processarLinha("========== QUEIMAGAS / MEDIDAS ==========");
+      processarLinha(`Temperatura da agua: ${agua.toFixed(2)} C`);
+      processarLinha(`Presenca de gas: ${quente ? "Yes" : "No"}`);
+      processarLinha(`Presenca de chama: ${quente ? "Yes" : "No"}`);
+      processarLinha(`Calor: ${calor} J`);
+
+      // Teste do barramento (quadro 0x123 com contador e estado do TWAI)
+      processarLinha("TX: ESP_OK");
+      processarLinha(`RX id=0x123 dado=${t % 256}`);
+      processarLinha("estado=1 txErr=0 rxErr=0");
     }, 1000);
   };
 
@@ -310,6 +464,8 @@ function Dashboard() {
   }, []);
 
   const temp = valores.temperatura;
+  // gás detectado sem chama no queimador
+  const gasSemChama = valores.presencaGas === 1 && valores.presencaChama === 0;
   const potencia =
     valores.tensao !== null && valores.corrente !== null ? valores.tensao * valores.corrente : null;
 
@@ -404,9 +560,9 @@ function Dashboard() {
             )}
           </div>
           <p className="mt-3 text-xs text-muted-foreground">
-            Ligue a ESP32 mestra no computador pelo cabo USB, feche o Monitor Serial da Arduino IDE e
-            clique em Conectar. O navegador vai pedir para escolher a porta (COM). Funciona no Chrome
-            e no Edge.
+            Ligue a ESP32 mestra no computador pelo cabo USB, feche o Monitor Serial da Arduino IDE
+            e clique em Conectar. O navegador vai pedir para escolher a porta (COM). Funciona no
+            Chrome e no Edge.
           </p>
           {!serialSuportado && (
             <p className="mt-2 text-xs text-warn">
@@ -421,8 +577,30 @@ function Dashboard() {
           )}
           {erroCan && (
             <div className="mt-3 flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
-              <AlertTriangle className="h-4 w-4 shrink-0" />
-              A mestra informou falha ao iniciar o CAN. Verifique os pinos e o transceiver.
+              <AlertTriangle className="h-4 w-4 shrink-0" />A mestra informou falha ao iniciar o
+              CAN. Verifique os pinos e o transceiver.
+            </div>
+          )}
+          {barramento && (
+            <div className="mt-3 rounded-xl border border-border bg-background/40 px-4 py-3 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="uppercase tracking-widest text-muted-foreground">
+                  Barramento CAN
+                </span>
+                <span
+                  className={`text-mono font-semibold ${
+                    ESTADOS_TWAI[barramento.estado]?.ok ? "text-neon" : "text-danger"
+                  }`}
+                >
+                  {ESTADOS_TWAI[barramento.estado]?.texto ?? `ESTADO ${barramento.estado}`}
+                </span>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-mono text-muted-foreground">
+                <span>Erros TX: {barramento.txErr}</span>
+                <span>Erros RX: {barramento.rxErr}</span>
+                <span>Último envio: {ultimoTx ?? "—"}</span>
+                <span>Teste recebido: {ultimoRx ? `${ultimoRx.id} = ${ultimoRx.dado}` : "—"}</span>
+              </div>
             </div>
           )}
 
@@ -462,8 +640,8 @@ function Dashboard() {
               ))}
             </div>
             <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
-              <Power className="h-3.5 w-3.5" />
-              A mestra atual só envia leituras. Ligar/desligar e o setpoint ainda não são enviados ao reator.
+              <Power className="h-3.5 w-3.5" />A mestra atual só envia leituras. Ligar/desligar e o
+              setpoint ainda não são enviados ao reator.
             </p>
           </div>
         </div>
@@ -471,10 +649,38 @@ function Dashboard() {
         <div className="rounded-2xl panel-grad border border-border p-5">
           <SectionTitle icon={<Activity className="h-4 w-4" />} label="Telemetria Crítica" />
           <div className="mt-4 grid grid-cols-2 gap-3">
-            <Metric icon={<Thermometer className="h-4 w-4 text-neon" />} label="Temp. Reator" value={fmt(temp, 0)} unit={UNIDADES.temperatura} tone="neon" compact />
-            <Metric icon={<Zap className="h-4 w-4 text-warn" />} label="Potência" value={fmt(potencia, 0)} unit="W" tone="warn" compact />
-            <Metric icon={<Wind className="h-4 w-4 text-cyan" />} label="Nitrogênio" value={fmt(valores.nitrogenio, 2)} unit={UNIDADES.nitrogenio} tone="cyan" compact />
-            <Metric icon={<Droplets className="h-4 w-4 text-warn" />} label="Bio-óleo" value={fmt(valores.biooleo, 2)} unit={UNIDADES.biooleo} tone="warn" compact />
+            <Metric
+              icon={<Thermometer className="h-4 w-4 text-neon" />}
+              label="Temp. Reator"
+              value={fmt(temp, 0)}
+              unit={UNIDADES.temperatura}
+              tone="neon"
+              compact
+            />
+            <Metric
+              icon={<Zap className="h-4 w-4 text-warn" />}
+              label="Potência"
+              value={fmt(potencia, 0)}
+              unit="W"
+              tone="warn"
+              compact
+            />
+            <Metric
+              icon={<Flame className="h-4 w-4 text-warn" />}
+              label="Chama"
+              value={simNao(valores.presencaChama)}
+              unit=""
+              tone="warn"
+              compact
+            />
+            <Metric
+              icon={<Wind className="h-4 w-4 text-cyan" />}
+              label="Gás"
+              value={simNao(valores.presencaGas)}
+              unit=""
+              tone="cyan"
+              compact
+            />
           </div>
         </div>
       </section>
@@ -482,11 +688,7 @@ function Dashboard() {
       {/* SUBGROUPS */}
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
         {/* GRUPO 2 */}
-        <Card
-          tag="Grupo 2"
-          title="Fluxo de Nitrogênio"
-          icon={<Wind className="h-4 w-4" />}
-        >
+        <Card tag="Grupo 2" title="Fluxo de Nitrogênio" icon={<Wind className="h-4 w-4" />}>
           <Metric
             icon={<Wind className="h-4 w-4 text-cyan" />}
             label="Nitrogênio"
@@ -496,19 +698,60 @@ function Dashboard() {
           <Spark data={series.nitrogenio} color="var(--cyan)" />
         </Card>
 
-        {/* GRUPO 3 */}
+        {/* TEMPERATURAS (ID 0x100) */}
         <Card
-          tag="Grupo 3"
+          tag="Escrava Temperatura · ID 0x100"
+          title="Temperaturas do Reator"
+          icon={<Thermometer className="h-4 w-4" />}
+          className="md:col-span-2"
+        >
+          <AvisoOffline online={escravaOnline.temperatura} nome="Temperatura" />
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-6">
+            {TERMOPARES.map(({ sensor, rotulo }) => (
+              <Metric
+                key={sensor}
+                icon={<Thermometer className="h-4 w-4 text-neon" />}
+                label={rotulo}
+                value={fmt(valores[sensor], 1)}
+                unit={UNIDADES[sensor]}
+                compact
+              />
+            ))}
+          </div>
+        </Card>
+
+        {/* QUEIMAGAS (ID 0x600) */}
+        <Card
+          tag="Escrava Queimagas · ID 0x600"
           title="Queima e Segurança"
           icon={<Flame className="h-4 w-4" />}
         >
-          <Metric
-            icon={<Flame className="h-4 w-4 text-warn" />}
-            label="Queima"
-            value={fmt(valores.queima, 2)}
-            unit={UNIDADES.queima}
-          />
-          <Spark data={series.queima} color="var(--warn)" />
+          <AvisoOffline online={escravaOnline.queimagas} nome="Queimagas" />
+          {gasSemChama && (
+            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              Gás detectado sem chama no queimador
+            </div>
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            <Metric
+              icon={<Droplets className="h-4 w-4 text-cyan" />}
+              label="Temp. Água"
+              value={fmt(valores.temperaturaAgua, 1)}
+              unit={UNIDADES.temperaturaAgua}
+              compact
+            />
+            <Metric
+              icon={<Flame className="h-4 w-4 text-warn" />}
+              label="Calor"
+              value={fmt(valores.calor, 0)}
+              unit={UNIDADES.calor}
+              compact
+              tone="warn"
+            />
+          </div>
+          <SimNaoBadge label="Presença de gás" valor={valores.presencaGas} />
+          <SimNaoBadge label="Presença de chama" valor={valores.presencaChama} />
         </Card>
 
         {/* GRUPO 4 */}
@@ -521,7 +764,10 @@ function Dashboard() {
           />
           <div className="h-44">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={series.volumeGas} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+              <AreaChart
+                data={series.volumeGas}
+                margin={{ top: 5, right: 5, left: -20, bottom: 0 }}
+              >
                 <defs>
                   <linearGradient id="gPyro" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="var(--neon)" stopOpacity={0.7} />
@@ -554,17 +800,12 @@ function Dashboard() {
 
         {/* GRUPO 6 */}
         <Card
-          tag="Grupo 6"
+          tag="Grupo 6 · Escrava Aquecimento · ID 0x200"
           title="Eficiência Energética e Aquecimento"
           icon={<Zap className="h-4 w-4" />}
           className="md:col-span-2"
         >
-          {aquecimentoOnline === false && (
-            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
-              <AlertTriangle className="h-4 w-4" />
-              Sem comunicação com a escrava de aquecimento (últimos valores mostrados)
-            </div>
-          )}
+          <AvisoOffline online={escravaOnline.aquecimento} nome="Aquecimento" />
           <div className="grid gap-3 sm:grid-cols-3">
             <Metric
               icon={<Zap className="h-4 w-4 text-warn" />}
@@ -614,13 +855,13 @@ function Dashboard() {
           </div>
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={series.temperatura} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+              <LineChart
+                data={series.temperatura}
+                margin={{ top: 10, right: 10, left: -15, bottom: 0 }}
+              >
                 <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
                 <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
-                <YAxis
-                  domain={[0, 650]}
-                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
-                />
+                <YAxis domain={[0, 650]} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
                 <Tooltip
                   contentStyle={{
                     background: "var(--popover)",
@@ -662,15 +903,9 @@ function Dashboard() {
         </Card>
 
         {/* GRUPO 8 */}
-        <Card
-          tag="Grupo 8"
-          title="Subproduto · Bio-óleo"
-          icon={<Droplets className="h-4 w-4" />}
-        >
+        <Card tag="Grupo 8" title="Subproduto · Bio-óleo" icon={<Droplets className="h-4 w-4" />}>
           <div className="rounded-xl border border-border bg-background/40 p-4">
-            <div className="text-xs uppercase tracking-widest text-muted-foreground">
-              Bio-óleo
-            </div>
+            <div className="text-xs uppercase tracking-widest text-muted-foreground">Bio-óleo</div>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-mono text-4xl text-warn">{fmt(valores.biooleo, 2)}</span>
               <span className="text-sm text-muted-foreground">{UNIDADES.biooleo}</span>
@@ -712,11 +947,12 @@ function Dashboard() {
 
       <footer className="mt-8 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
         <span>
-          {conn === "simulacao" ? "Modo simulação (dados gerados no navegador)" : "Telemetria ao vivo · ESP32 mestra via USB"}
-          {lastUpdate &&
-            ` · último dado às ${lastUpdate.toLocaleTimeString("pt-BR")}`}
+          {conn === "simulacao"
+            ? "Modo simulação (dados gerados no navegador)"
+            : "Telemetria ao vivo · ESP32 mestra via USB"}
+          {lastUpdate && ` · último dado às ${lastUpdate.toLocaleTimeString("pt-BR")}`}
         </span>
-        <span className="text-mono">PIRO-RICE · v1.2</span>
+        <span className="text-mono">PIRO-RICE · v1.3</span>
       </footer>
     </main>
   );
@@ -857,25 +1093,32 @@ function Spark({ data, color }: { data: Point[]; color: string }) {
   );
 }
 
-function SafetyBadge({ label, active }: { label: string; active: boolean }) {
+function AvisoOffline({ online, nome }: { online: boolean | null; nome: string }) {
+  if (online !== false) return null;
+  return (
+    <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+      <AlertTriangle className="h-4 w-4 shrink-0" />
+      Sem comunicação com a escrava {nome} (últimos valores mostrados)
+    </div>
+  );
+}
+
+function SimNaoBadge({ label, valor }: { label: string; valor: number | null }) {
+  const sim = valor === 1;
   return (
     <div
       className={`flex items-center justify-between rounded-xl border px-3 py-2.5 transition-colors ${
-        active
-          ? "border-danger/50 bg-danger/10 text-danger"
+        sim
+          ? "border-warn/50 bg-warn/10 text-warn"
           : "border-border bg-background/40 text-muted-foreground"
       }`}
     >
       <span className="flex items-center gap-2 text-xs">
-        {active ? (
-          <AlertTriangle className="h-4 w-4" />
-        ) : (
-          <CheckCircle2 className="h-4 w-4 text-neon" />
-        )}
+        {sim ? <Flame className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4 text-neon" />}
         {label}
       </span>
-      <span className={`text-xs font-bold tracking-widest ${active ? "" : "text-foreground"}`}>
-        {active ? "SIM" : "NÃO"}
+      <span className={`text-xs font-bold tracking-widest ${sim ? "" : "text-foreground"}`}>
+        {simNao(valor)}
       </span>
     </div>
   );
