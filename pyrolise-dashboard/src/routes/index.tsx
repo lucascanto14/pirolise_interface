@@ -17,6 +17,8 @@ import {
   Usb,
   Unplug,
   PlayCircle,
+  Download,
+  RotateCcw,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -190,6 +192,53 @@ function pushSeries(series: Point[], v: number, t: number): Point[] {
   return next.length > MAX_POINTS ? next.slice(next.length - MAX_POINTS) : next;
 }
 
+// Histórico completo dos termopares durante o ensaio (gráfico temperatura × tempo).
+// Uma linha por segundo; cada termopar entra na linha do segundo em que chegou.
+type LinhaHistorico = { t: number } & Partial<Record<SensorName, number>>;
+const MAX_PONTOS_GRAFICO = 600; // acima disso o gráfico mostra médias por intervalo
+
+const CORES_TERMOPARES = [
+  "#ef4444",
+  "#f97316",
+  "#eab308",
+  "#84cc16",
+  "#22c55e",
+  "#14b8a6",
+  "#06b6d4",
+  "#3b82f6",
+  "#8b5cf6",
+  "#d946ef",
+  "#94a3b8",
+];
+
+// Reduz o histórico para no máximo MAX_PONTOS_GRAFICO pontos (média por intervalo)
+function reduzirHistorico(linhas: LinhaHistorico[]): LinhaHistorico[] {
+  // cópia: o Recharts só redesenha quando recebe um array novo
+  if (linhas.length <= MAX_PONTOS_GRAFICO) return linhas.map((l) => ({ ...l }));
+  const passo = Math.ceil(linhas.length / MAX_PONTOS_GRAFICO);
+  const saida: LinhaHistorico[] = [];
+  for (let i = 0; i < linhas.length; i += passo) {
+    const grupo = linhas.slice(i, i + passo);
+    const media: LinhaHistorico = { t: grupo[0].t };
+    for (const { sensor } of TERMOPARES) {
+      const vals = grupo.map((l) => l[sensor]).filter((v): v is number => v !== undefined);
+      if (vals.length)
+        media[sensor] = Number((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2));
+    }
+    saida.push(media);
+  }
+  return saida;
+}
+
+function fmtTempo(seg: number) {
+  const h = Math.floor(seg / 3600);
+  const m = Math.floor((seg % 3600) / 60);
+  const ss = seg % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`
+    : `${m}:${String(ss).padStart(2, "0")}`;
+}
+
 function fmt(n: number | null, d = 1) {
   return n === null ? "—" : n.toFixed(d);
 }
@@ -237,6 +286,16 @@ function Dashboard() {
   const leitorRef = useRef<ReadableStreamDefaultReader<string> | null>(null);
   const simulacaoRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startRef = useRef(Date.now());
+  // histórico dos termopares desde o início do ensaio (null = ainda não chegou nada)
+  const historicoRef = useRef<LinhaHistorico[]>([]);
+  const inicioEnsaioRef = useRef<number | null>(null);
+  const [visiveis, setVisiveis] = useState<Record<SensorName, boolean>>(
+    () =>
+      Object.fromEntries(TERMOPARES.map(({ sensor }) => [sensor, true])) as Record<
+        SensorName,
+        boolean
+      >,
+  );
 
   const online = conn === "conectado" || conn === "simulacao";
 
@@ -290,8 +349,42 @@ function Dashboard() {
     if (valor !== null) {
       const t = Math.round((Date.now() - startRef.current) / 1000);
       setSeries((s) => ({ ...s, [sensor]: pushSeries(s[sensor], valor, t) }));
+      if (escrava === "temperatura") registrarHistorico(sensor, valor);
     }
     setLastUpdate(new Date());
+  };
+
+  function registrarHistorico(sensor: SensorName, valor: number) {
+    const agora = Date.now();
+    if (inicioEnsaioRef.current === null) inicioEnsaioRef.current = agora;
+    const t = Math.round((agora - inicioEnsaioRef.current) / 1000);
+    const hist = historicoRef.current;
+    const ultima = hist[hist.length - 1];
+    if (ultima && ultima.t === t) ultima[sensor] = valor;
+    else hist.push({ t, [sensor]: valor });
+  }
+
+  const zerarHistorico = () => {
+    historicoRef.current = [];
+    inicioEnsaioRef.current = null;
+    setNow(new Date());
+  };
+
+  // CSV com todas as leituras do ensaio (sem redução), separador ";" para o Excel em português
+  const baixarCsv = () => {
+    const cab = ["tempo_s", ...TERMOPARES.map(({ rotulo }) => `${rotulo}_C`)].join(";");
+    const linhas = historicoRef.current.map((l) =>
+      [l.t, ...TERMOPARES.map(({ sensor }) => (l[sensor] ?? "").toString().replace(".", ","))].join(
+        ";",
+      ),
+    );
+    const blob = new Blob([[cab, ...linhas].join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `termopares_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const pararSimulacao = () => {
@@ -400,6 +493,7 @@ function Dashboard() {
     setBarramento(null);
     setUltimoTx(null);
     setUltimoRx(null);
+    zerarHistorico();
     setConn("simulacao");
     let temperatura = 25;
     let energia = 0;
@@ -466,6 +560,15 @@ function Dashboard() {
   const temp = valores.temperatura;
   // gás detectado sem chama no queimador
   const gasSemChama = valores.presencaGas === 1 && valores.presencaChama === 0;
+  // atualiza o gráfico do ensaio uma vez por segundo (junto com o relógio)
+  const historicoGrafico = useMemo(
+    () => reduzirHistorico(historicoRef.current),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [now],
+  );
+  const duracaoEnsaio = historicoRef.current.length
+    ? historicoRef.current[historicoRef.current.length - 1].t
+    : 0;
   const potencia =
     valores.tensao !== null && valores.corrente !== null ? valores.tensao * valores.corrente : null;
 
@@ -720,6 +823,109 @@ function Dashboard() {
           </div>
         </Card>
 
+        {/* GRÁFICO TEMPERATURA × TEMPO (todos os termopares, ensaio inteiro) */}
+        <Card
+          tag="Escrava Temperatura · ID 0x100"
+          title="Temperatura × Tempo do Ensaio"
+          icon={<Activity className="h-4 w-4" />}
+          className="md:col-span-2 xl:col-span-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+            <span className="text-mono">
+              Duração: {fmtTempo(duracaoEnsaio)} · {historicoRef.current.length} leituras
+            </span>
+            <div className="flex gap-2">
+              <button
+                onClick={baixarCsv}
+                disabled={!historicoRef.current.length}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/40 px-3 py-1.5 hover:border-cyan hover:text-cyan transition disabled:opacity-40"
+              >
+                <Download className="h-3.5 w-3.5" />
+                Baixar CSV
+              </button>
+              <button
+                onClick={zerarHistorico}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background/40 px-3 py-1.5 hover:border-danger hover:text-danger transition"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Novo ensaio
+              </button>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {TERMOPARES.map(({ sensor, rotulo }, i) => (
+              <button
+                key={sensor}
+                onClick={() => setVisiveis((v) => ({ ...v, [sensor]: !v[sensor] }))}
+                className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] text-mono transition ${
+                  visiveis[sensor]
+                    ? "border-border bg-background/60 text-foreground"
+                    : "border-border/40 text-muted-foreground opacity-50"
+                }`}
+              >
+                <span
+                  className="inline-block h-2 w-3 rounded"
+                  style={{ background: CORES_TERMOPARES[i] }}
+                />
+                {rotulo}
+              </button>
+            ))}
+          </div>
+          <div className="h-80">
+            {historicoGrafico.length ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={historicoGrafico}
+                  margin={{ top: 10, right: 10, left: -10, bottom: 0 }}
+                >
+                  <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                  <XAxis
+                    dataKey="t"
+                    type="number"
+                    domain={["dataMin", "dataMax"]}
+                    tickFormatter={fmtTempo}
+                    tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                  />
+                  <YAxis
+                    unit=" °C"
+                    tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+                    width={60}
+                  />
+                  <Tooltip
+                    labelFormatter={(t) => `Tempo ${fmtTempo(Number(t))}`}
+                    formatter={(v) => `${Number(v).toFixed(1)} °C`}
+                    contentStyle={{
+                      background: "var(--popover)",
+                      border: "1px solid var(--border)",
+                      borderRadius: 8,
+                      fontSize: 12,
+                    }}
+                  />
+                  {TERMOPARES.map(({ sensor, rotulo }, i) =>
+                    visiveis[sensor] ? (
+                      <Line
+                        key={sensor}
+                        type="monotone"
+                        dataKey={sensor}
+                        name={rotulo}
+                        stroke={CORES_TERMOPARES[i]}
+                        strokeWidth={1.8}
+                        dot={false}
+                        connectNulls
+                        isAnimationActive={false}
+                      />
+                    ) : null,
+                  )}
+                </LineChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="grid h-full place-items-center text-xs text-muted-foreground">
+                O gráfico começa quando a escrava Temperatura enviar a primeira leitura.
+              </div>
+            )}
+          </div>
+        </Card>
+
         {/* QUEIMAGAS (ID 0x600) */}
         <Card
           tag="Escrava Queimagas · ID 0x600"
@@ -727,12 +933,17 @@ function Dashboard() {
           icon={<Flame className="h-4 w-4" />}
         >
           <AvisoOffline online={escravaOnline.queimagas} nome="Queimagas" />
-          {gasSemChama && (
-            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs text-danger">
+          {gasSemChama ? (
+            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs font-semibold text-danger">
               <AlertTriangle className="h-4 w-4 shrink-0" />
-              Gás detectado sem chama no queimador
+              Estado: Perigo, há gás mas não há chama
             </div>
-          )}
+          ) : valores.presencaGas !== null && valores.presencaChama !== null ? (
+            <div className="flex items-center gap-2 rounded-xl border border-neon/40 bg-neon/10 px-4 py-2.5 text-xs font-semibold text-neon">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              Estado: Estável
+            </div>
+          ) : null}
           <div className="grid grid-cols-2 gap-3">
             <Metric
               icon={<Droplets className="h-4 w-4 text-cyan" />}
