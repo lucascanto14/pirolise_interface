@@ -1,39 +1,65 @@
 /*
   ============================================================================
-   ESP32 MESTRA - RECEPCAO CAN (TWAI) + TESTE DE BARRAMENTO
+   ESP32 MESTRA - RECEPCAO CAN (TWAI) + SAIDA PELA USB (SERIAL)
    ESP32 DevKit V1 / Arduino-ESP32 3.3.x
 
    Escravas:
      Temperatura: ID 0x100 (10 MAX6675 + DHT22)
      Aquecimento: ID 0x200
+     Balanca:     ID 0x500 (massa do bio-oleo)
      Queimagas:   ID 0x600
 
    CAN: 500 kbps, CAN padrao (11 bits)
+   Saida: USB / Serial a 115200 baud (sem Wi-Fi)
 
-   Ligacao com o transceiver CAN:
-     GPIO21 (TX) -> TX / CTX / D do transceiver
-     GPIO22 (RX) -> RX / CRX / R do transceiver
-   Nao use GPIO1 e GPIO3: sao o TX/RX do USB (Serial).
+   MODO DE SAIDA (escolha em SAIDA_JSON, logo abaixo):
+     0 = texto legivel no Monitor Serial (cada mensagem CAN e impressa)
+     1 = uma linha JSON por segundo com todos os dados, para um programa
+         ou pagina no notebook ler pela porta serial
 
-   Baseado no teste TWAI (2026-11-26):
-     - envia um quadro de teste ID 0x123 com contador a cada 500 ms
-     - imprime "TX: ...", "RX id=0x... dado=..." e "estado=... txErr=... rxErr=..."
-     - recupera o barramento sozinho quando entra em BUS-OFF
-   O site le essas linhas pelo USB junto com as das escravas.
+   PROTOCOLO TEMPERATURA (ID 0x100):
+     DLC 7 | byte0 = tipo (0x01..0x04) | 3 x int16 little-endian
+     Escala: valor * 10  (0,1 C de resolucao, faixa -3276,7 a +3276,7 C)
+     INT16_MIN (0x8000) = sem leitura
+     >>> A escrava de temperatura precisa usar a MESMA escala (x10) <<<
+
+   PROTOCOLO BALANCA (ID 0x500):
+     DLC 4 | bytes 0..3 = float IEEE-754 (little-endian), massa em kg
+
+   LINHAS LIDAS PELO SITE (pyrolise-dashboard), alem das medidas:
+     "estado=N txErr=A rxErr=B"  estado do barramento, a cada 1 s
+     "TX: ESP_OK"                resultado do quadro de teste (se ENVIAR_TESTE)
+     "RX id=0x123 dado=42"       qualquer ID fora de 0x100/0x200/0x500/0x600
+   No modo JSON o site le a linha JSON (o estado do barramento vai junto).
   ============================================================================
 */
 
 #include <Arduino.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 #include "driver/twai.h"
 
+// ============================ MODO DE SAIDA =================================
+#define SAIDA_JSON 0   // 0 = texto legivel | 1 = linha JSON a cada segundo
+
+const uint32_t INTERVALO_JSON_MS = 1000;
+
+#if SAIDA_JSON
+  #define LOGF(...)  do {} while (0)
+  #define LOGLN(x)   do {} while (0)
+#else
+  #define LOGF(...)  Serial.printf(__VA_ARGS__)
+  #define LOGLN(x)   Serial.println(x)
+#endif
+
 // ============================ CONFIGURACAO CAN ==============================
-#define CAN_TX_PIN          21   // antes: 1 (pino do USB, apagava o Serial)
-#define CAN_RX_PIN          22   // antes: 3 (pino do USB, apagava o Serial)
+#define CAN_TX_PIN          5
+#define CAN_RX_PIN          4
 
 #define CAN_ID_TEMPERATURA  0x100
 #define CAN_ID_AQUECIMENTO  0x200
+#define CAN_ID_MASSA        0x500
 #define CAN_ID_QUEIMAGAS    0x600
 
 #define MSG_MEDIDAS         0x01
@@ -47,13 +73,22 @@
 #define MSG_QUEIMAGAS_MEDIDAS 0x01
 #define MSG_QUEIMAGAS_CALOR   0x02
 
-const uint32_t TIMEOUT_CAN_MS = 3000;
+// Escala das temperaturas da escrava 0x100 (deve ser igual na escrava)
+#define ESCALA_TEMPERATURA  10.0f
+
+#define CAN_RX_QUEUE_LEN    32
+
+const uint32_t TIMEOUT_CAN_MS            = 3000;
+const uint32_t INTERVALO_CHECK_CAN_MS    = 500;
+const uint32_t INTERVALO_REINIT_CAN_MS   = 5000;
+const uint32_t INTERVALO_STATUS_MS       = 1000;  // linha "estado=..." para o site
 
 // ----------------------- Teste do barramento --------------------------------
+// Quadro de teste ID 0x123 com contador. Use true so para testar o barramento:
+// com a mestra sozinha no fio (sem ACK) ele faz os contadores de erro subirem.
 #define CAN_ID_TESTE        0x123
-const bool     ENVIAR_TESTE     = true;  // false = mestra so escuta
-const uint32_t INTERVALO_TX_MS  = 500;   // envio do quadro de teste
-const uint32_t INTERVALO_STATUS_MS = 500; // impressao do estado do barramento
+const bool     ENVIAR_TESTE     = false;
+const uint32_t INTERVALO_TX_MS  = 500;
 
 // =============================== DADOS ======================================
 
@@ -62,7 +97,6 @@ float temperaturas[11] = {
   NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN
 };
 
-bool recebeuTemperaturas[4] = {false, false, false, false};
 uint32_t ultimaMensagemTemperatura = 0;
 bool desconexaoTemperaturaInformada = false;
 
@@ -72,13 +106,14 @@ float tensao = NAN;
 float corrente = NAN;
 float energiaConsumida = NAN;
 
-bool recebeuMedidas = false;
-bool recebeuEnergia = false;
+uint32_t ultimaMensagemAquecimento = 0;
 bool desconexaoInformada = false;
 
-uint32_t ultimaMensagemAquecimento = 0;
-uint32_t ultimaMensagemMedidas = 0;
-uint32_t ultimaMensagemEnergia = 0;
+// ----------------------- Balanca (ID 0x500) --------------------------------
+float massaKg = NAN;
+
+uint32_t ultimaMensagemMassa = 0;
+bool desconexaoMassaInformada = false;
 
 // ----------------------- Queimagas (ID 0x600) ------------------------------
 float temperaturaAgua = NAN;
@@ -88,226 +123,257 @@ int8_t presencaChama = -1;
 uint32_t calorJoules = 0;
 bool calorValido = false;
 
-bool recebeuMedidasQueimagas = false;
-bool recebeuCalorQueimagas = false;
-bool desconexaoQueimagasInformada = false;
-
 uint32_t ultimaMensagemQueimagas = 0;
+bool desconexaoQueimagasInformada = false;
 
 // ----------------------- Status CAN -----------------------------------------
 bool canOk = false;
+uint32_t ultimaVerificacaoCAN = 0;
+uint32_t ultimaTentativaInitCAN = 0;
+uint32_t ultimoEnvioJson = 0;
 
-// ============================ INICIALIZACAO =================================
+// ultimo estado lido do driver TWAI (-1 = ainda nao lido)
+int estadoBarramento = -1;
+uint32_t txErrBarramento = 0;
+uint32_t rxErrBarramento = 0;
+
+// ============================ JSON (SAIDA_JSON = 1) =========================
+String floatParaJson(float valor, int casas) {
+  if (isnan(valor) || isinf(valor)) {
+    return "null";
+  }
+  return String(valor, casas);
+}
+
+bool estaOnline(uint32_t ultimaMensagem, uint32_t agora) {
+  return (ultimaMensagem != 0) && (agora - ultimaMensagem <= TIMEOUT_CAN_MS);
+}
+
+String gerarJsonTelemetria() {
+  String json;
+  json.reserve(800);
+  json = "{";
+
+  uint32_t agora = millis();
+
+  json += "\"can_ok\":";
+  json += (canOk ? "true" : "false");
+  json += ",";
+
+  // Estado do barramento (0 parado, 1 ok, 2 bus-off, 3 recuperando)
+  json += "\"barramento\":{\"estado\":";
+  json += (estadoBarramento < 0 ? String("null") : String(estadoBarramento));
+  json += ",\"tx_err\":";
+  json += String(txErrBarramento);
+  json += ",\"rx_err\":";
+  json += String(rxErrBarramento);
+  json += "},";
+
+  // Temperatura (ID 0x100)
+  json += "\"temperatura\":{\"online\":";
+  json += (estaOnline(ultimaMensagemTemperatura, agora) ? "true" : "false");
+  json += ",\"termopares\":[";
+  for (int i = 0; i < 10; i++) {
+    json += floatParaJson(temperaturas[i], 1);
+    if (i < 9) json += ",";
+  }
+  json += "],\"dht22\":";
+  json += floatParaJson(temperaturas[10], 1);
+  json += "},";
+
+  // Aquecimento (ID 0x200)
+  json += "\"aquecimento\":{\"online\":";
+  json += (estaOnline(ultimaMensagemAquecimento, agora) ? "true" : "false");
+  json += ",\"temperatura_reator\":";
+  json += floatParaJson(temperaturaReator, 2);
+  json += ",\"tensao\":";
+  json += floatParaJson(tensao, 1);
+  json += ",\"corrente\":";
+  json += floatParaJson(corrente, 3);
+  json += ",\"energia_kwh\":";
+  json += floatParaJson(energiaConsumida, 3);
+  json += "},";
+
+  // Balanca (ID 0x500)
+  json += "\"balanca\":{\"online\":";
+  json += (estaOnline(ultimaMensagemMassa, agora) ? "true" : "false");
+  json += ",\"massa_kg\":";
+  json += floatParaJson(massaKg, 3);
+  json += "},";
+
+  // Queimagas (ID 0x600)
+  json += "\"queimagas\":{\"online\":";
+  json += (estaOnline(ultimaMensagemQueimagas, agora) ? "true" : "false");
+  json += ",\"temperatura_agua\":";
+  json += floatParaJson(temperaturaAgua, 2);
+  json += ",\"presenca_gas\":";
+  json += String((int)presencaGas);
+  json += ",\"presenca_chama\":";
+  json += String((int)presencaChama);
+  json += ",\"calor_joules\":";
+  json += (calorValido ? String(calorJoules) : String("null"));
+  json += "}";
+
+  json += "}";
+  return json;
+}
+
+void enviarJsonSerial() {
+#if SAIDA_JSON
+  uint32_t agora = millis();
+  if (agora - ultimoEnvioJson >= INTERVALO_JSON_MS) {
+    ultimoEnvioJson = agora;
+    Serial.println(gerarJsonTelemetria());
+  }
+#endif
+}
+
+// ============================ CAN ===========================================
 bool iniciarCAN() {
+  twai_general_config_t configGeral =
+    TWAI_GENERAL_CONFIG_DEFAULT(
+      (gpio_num_t)CAN_TX_PIN,
+      (gpio_num_t)CAN_RX_PIN,
+      TWAI_MODE_NORMAL
+    );
+  configGeral.rx_queue_len = CAN_RX_QUEUE_LEN;
 
-  twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
-    (gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_timing_config_t  t = TWAI_TIMING_CONFIG_500KBITS();
-  twai_filter_config_t  f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+  twai_timing_config_t configTempo = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t configFiltro = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-  if (twai_driver_install(&g, &t, &f) != ESP_OK || twai_start() != ESP_OK) {
-    Serial.println("Falha ao iniciar TWAI");
-    Serial.println("[CAN] Falha na inicializacao. Verifique pinos e transceiver.");
+  esp_err_t resultado = twai_driver_install(&configGeral, &configTempo, &configFiltro);
+  if (resultado != ESP_OK) {
+    LOGF("[CAN] Erro ao instalar driver: %d (%s)\n",
+         (int)resultado, esp_err_to_name(resultado));
+    return false;
+  }
+
+  resultado = twai_start();
+  if (resultado != ESP_OK) {
+    LOGF("[CAN] Erro ao iniciar driver: %d (%s)\n",
+         (int)resultado, esp_err_to_name(resultado));
     twai_driver_uninstall();
     return false;
   }
 
-  Serial.println("TWAI iniciado");
-  Serial.println("[CAN] Interface iniciada em 500 kbps.");
-  Serial.println("[CAN] Aguardando:");
-  Serial.println("  ID 0x100 - Temperatura");
-  Serial.println("  ID 0x200 - Aquecimento");
-  Serial.println("  ID 0x600 - Queimagas");
-
+  LOGLN("[CAN] Interface iniciada em 500 kbps.");
+  LOGLN("[CAN] Aguardando:");
+  LOGLN("  ID 0x100 - Temperatura");
+  LOGLN("  ID 0x200 - Aquecimento");
+  LOGLN("  ID 0x500 - Balanca");
+  LOGLN("  ID 0x600 - Queimagas");
   return true;
 }
 
-// ======================== TESTE / ESTADO DO BARRAMENTO =====================
-void enviarTeste() {
+// Recupera de bus-off e reinicia o controlador quando necessario
+void verificarBarramentoCAN() {
+  uint32_t agora = millis();
 
-  static uint8_t cnt = 0;
-  static uint32_t ultimoEnvio = 0;
+  if (!canOk) {
+    if (agora - ultimaTentativaInitCAN >= INTERVALO_REINIT_CAN_MS) {
+      ultimaTentativaInitCAN = agora;
+      LOGLN("[CAN] Tentando iniciar a interface novamente...");
+      canOk = iniciarCAN();
+    }
+    return;
+  }
 
-  if (!ENVIAR_TESTE || millis() - ultimoEnvio < INTERVALO_TX_MS) return;
-  ultimoEnvio = millis();
+  if (agora - ultimaVerificacaoCAN < INTERVALO_CHECK_CAN_MS) return;
+  ultimaVerificacaoCAN = agora;
 
-  twai_message_t m = {};
-  m.identifier = CAN_ID_TESTE;
-  m.data_length_code = 1;
-  m.data[0] = cnt++;
+  twai_status_info_t status;
+  if (twai_get_status_info(&status) != ESP_OK) return;
 
-  // sem espera: a recepcao das escravas nao para enquanto o quadro sai
-  Serial.printf("TX: %s\n", esp_err_to_name(twai_transmit(&m, 0)));
-}
-
-void monitorarBarramento() {
+  estadoBarramento = (int)status.state;
+  txErrBarramento = status.tx_error_counter;
+  rxErrBarramento = status.rx_error_counter;
 
   static uint32_t ultimoStatus = 0;
-  if (millis() - ultimoStatus < INTERVALO_STATUS_MS) return;
-  ultimoStatus = millis();
+  if (agora - ultimoStatus >= INTERVALO_STATUS_MS) {
+    ultimoStatus = agora;
+    LOGF("estado=%d txErr=%lu rxErr=%lu\n", estadoBarramento,
+         (unsigned long)txErrBarramento, (unsigned long)rxErrBarramento);
+  }
 
-  twai_status_info_t s;
-  if (twai_get_status_info(&s) != ESP_OK) return;
-
-  Serial.printf("estado=%d txErr=%lu rxErr=%lu\n", (int)s.state,
-                (unsigned long)s.tx_error_counter, (unsigned long)s.rx_error_counter);
-
-  // BUS-OFF: pede recuperacao; quando termina o driver fica parado e precisa de start
-  if (s.state == TWAI_STATE_BUS_OFF) {
+  if (status.state == TWAI_STATE_BUS_OFF) {
+    LOGLN("[CAN] BUS-OFF detectado. Iniciando recuperacao...");
     twai_initiate_recovery();
-  } else if (s.state == TWAI_STATE_STOPPED) {
-    twai_start();
+  }
+  else if (status.state == TWAI_STATE_STOPPED) {
+    if (twai_start() == ESP_OK) {
+      LOGLN("[CAN] Barramento recuperado e interface reiniciada.");
+    }
+  }
+
+  static uint32_t ultimoOverrun = 0;
+  static uint32_t ultimoMissed = 0;
+  if (status.rx_overrun_count != ultimoOverrun || status.rx_missed_count != ultimoMissed) {
+    LOGF("[CAN] AVISO: mensagens perdidas (overrun=%lu, missed=%lu)\n",
+         (unsigned long)status.rx_overrun_count,
+         (unsigned long)status.rx_missed_count);
+    ultimoOverrun = status.rx_overrun_count;
+    ultimoMissed = status.rx_missed_count;
   }
 }
 
 // ========================== RECEPCAO TEMPERATURA ============================
-void receberTemperatura(const twai_message_t &mensagem) {
+void imprimirTemperatura(const char* nome, float valor) {
+  if (!isnan(valor)) LOGF("%s: %.1f C\n", nome, valor);
+  else LOGF("%s: SEM LEITURA\n", nome);
+}
 
-  if (mensagem.identifier != CAN_ID_TEMPERATURA) return;
+void receberTemperatura(const twai_message_t &mensagem) {
   if (mensagem.extd || mensagem.rtr || mensagem.data_length_code != 7) return;
 
   uint8_t tipoMensagem = mensagem.data[0];
+  if (tipoMensagem < MSG_TEMPERATURAS_1 || tipoMensagem > MSG_TEMPERATURAS_4) return;
 
-  // Cada temperatura ocupa 2 bytes (Little Endian)
-  int16_t dadosRaw[3];
-
+  float valores[3];
   for (int i = 0; i < 3; i++) {
-
     uint16_t bits =
       (uint16_t)mensagem.data[1 + i * 2] |
       ((uint16_t)mensagem.data[2 + i * 2] << 8);
-
-    dadosRaw[i] = (int16_t)bits;
+    int16_t raw = (int16_t)bits;
+    valores[i] = (raw == INT16_MIN) ? NAN : raw / ESCALA_TEMPERATURA;
   }
 
-  float valores[3];
+  // Quadro 1 -> T1..T3 | Quadro 2 -> T4..T6 | Quadro 3 -> T7..T9
+  // Quadro 4 -> T10 e DHT22 (terceiro valor nao usado)
+  int base = (tipoMensagem - 1) * 3;
+  int quantidade = (tipoMensagem == MSG_TEMPERATURAS_4) ? 2 : 3;
 
-  for (int i = 0; i < 3; i++) {
-    valores[i] = (dadosRaw[i] == INT16_MIN)
-                   ? NAN
-                   : dadosRaw[i] / 100.0f;
+  for (int i = 0; i < quantidade; i++) {
+    temperaturas[base + i] = valores[i];
   }
 
-  uint32_t agora = millis();
-
-  // ------------------------ QUADRO 1 --------------------------------------
-  if (tipoMensagem == MSG_TEMPERATURAS_1) {
-
-    temperaturas[0] = valores[0];
-    temperaturas[1] = valores[1];
-    temperaturas[2] = valores[2];
-
-    recebeuTemperaturas[0] = true;
-
-    Serial.println();
-    Serial.println("========== TEMPERATURAS / QUADRO 1 ==========");
-
-    for (int i = 0; i < 3; i++) {
-      if (!isnan(temperaturas[i])) {
-        Serial.printf("T%d: %.2f C\n", i + 1, temperaturas[i]);
-      } else {
-        Serial.printf("T%d: SEM LEITURA\n", i + 1);
-      }
+  LOGF("\n========== TEMPERATURAS / QUADRO %u ==========\n", tipoMensagem);
+  for (int i = 0; i < quantidade; i++) {
+    int indice = base + i;
+    if (indice == 10) {
+      imprimirTemperatura("DHT22", temperaturas[indice]);
+    } else {
+      char nome[6];
+      snprintf(nome, sizeof(nome), "T%d", indice + 1);
+      imprimirTemperatura(nome, temperaturas[indice]);
     }
-
-    Serial.println("==============================================");
   }
+  LOGLN("==============================================");
 
-  // ------------------------ QUADRO 2 --------------------------------------
-  else if (tipoMensagem == MSG_TEMPERATURAS_2) {
-
-    temperaturas[3] = valores[0];
-    temperaturas[4] = valores[1];
-    temperaturas[5] = valores[2];
-
-    recebeuTemperaturas[1] = true;
-
-    Serial.println();
-    Serial.println("========== TEMPERATURAS / QUADRO 2 ==========");
-
-    for (int i = 0; i < 3; i++) {
-      if (!isnan(temperaturas[i + 3])) {
-        Serial.printf("T%d: %.2f C\n", i + 4, temperaturas[i + 3]);
-      } else {
-        Serial.printf("T%d: SEM LEITURA\n", i + 4);
-      }
-    }
-
-    Serial.println("==============================================");
-  }
-
-  // ------------------------ QUADRO 3 --------------------------------------
-  else if (tipoMensagem == MSG_TEMPERATURAS_3) {
-
-    temperaturas[6] = valores[0];
-    temperaturas[7] = valores[1];
-    temperaturas[8] = valores[2];
-
-    recebeuTemperaturas[2] = true;
-
-    Serial.println();
-    Serial.println("========== TEMPERATURAS / QUADRO 3 ==========");
-
-    for (int i = 0; i < 3; i++) {
-      if (!isnan(temperaturas[i + 6])) {
-        Serial.printf("T%d: %.2f C\n", i + 7, temperaturas[i + 6]);
-      } else {
-        Serial.printf("T%d: SEM LEITURA\n", i + 7);
-      }
-    }
-
-    Serial.println("==============================================");
-  }
-
-  // ------------------------ QUADRO 4 --------------------------------------
-  else if (tipoMensagem == MSG_TEMPERATURAS_4) {
-
-    temperaturas[9] = valores[0];  // T10
-    temperaturas[10] = valores[1]; // DHT22
-
-    recebeuTemperaturas[3] = true;
-
-    Serial.println();
-    Serial.println("========== TEMPERATURAS / QUADRO 4 ==========");
-
-    if (!isnan(temperaturas[9]))
-      Serial.printf("T10: %.2f C\n", temperaturas[9]);
-    else
-      Serial.println("T10: SEM LEITURA");
-
-    if (!isnan(temperaturas[10]))
-      Serial.printf("DHT22: %.2f C\n", temperaturas[10]);
-    else
-      Serial.println("DHT22: SEM LEITURA");
-
-    Serial.println("==============================================");
-  }
-  else {
-    return;
-  }
-
-  ultimaMensagemTemperatura = agora;
+  ultimaMensagemTemperatura = millis();
   desconexaoTemperaturaInformada = false;
 }
 
 // ============================ RECEPCAO AQUECIMENTO ==========================
 void receberAquecimento(const twai_message_t &mensagem) {
-
-  if (mensagem.identifier != CAN_ID_AQUECIMENTO) return;
   if (mensagem.extd || mensagem.rtr || mensagem.data_length_code == 0) return;
 
   uint8_t tipoMensagem = mensagem.data[0];
   uint32_t agora = millis();
 
-  // ------------------------------------------------------------------------
-  // Mensagem 0x01: temperatura, tensao e corrente (7 bytes)
-  // ------------------------------------------------------------------------
   if (tipoMensagem == MSG_MEDIDAS && mensagem.data_length_code == 7) {
-
     uint16_t temperaturaBits =
       (uint16_t)mensagem.data[1] |
       ((uint16_t)mensagem.data[2] << 8);
-
     int16_t temperaturaRaw = (int16_t)temperaturaBits;
 
     uint16_t tensaoRaw =
@@ -318,130 +384,93 @@ void receberAquecimento(const twai_message_t &mensagem) {
       (uint16_t)mensagem.data[5] |
       ((uint16_t)mensagem.data[6] << 8);
 
-    temperaturaReator = (temperaturaRaw == INT16_MIN)
-                          ? NAN : temperaturaRaw / 100.0f;
+    temperaturaReator = (temperaturaRaw == INT16_MIN) ? NAN : temperaturaRaw / 100.0f;
+    tensao   = (tensaoRaw   == UINT16_MAX) ? NAN : tensaoRaw / 10.0f;
+    corrente = (correnteRaw == UINT16_MAX) ? NAN : correnteRaw / 1000.0f;
 
-    tensao = (tensaoRaw == UINT16_MAX)
-               ? NAN : tensaoRaw / 10.0f;
-
-    corrente = (correnteRaw == UINT16_MAX)
-                 ? NAN : correnteRaw / 1000.0f;
-
-    recebeuMedidas = true;
-    ultimaMensagemMedidas = agora;
     ultimaMensagemAquecimento = agora;
     desconexaoInformada = false;
 
-    Serial.println();
-    Serial.println("========== AQUECIMENTO / MEDIDAS ==========");
+    LOGLN("\n========== AQUECIMENTO / MEDIDAS ==========");
+    if (!isnan(temperaturaReator)) LOGF("Temperatura do reator: %.2f C\n", temperaturaReator);
+    else LOGLN("Temperatura do reator: SEM LEITURA");
 
-    if (!isnan(temperaturaReator))
-      Serial.printf("Temperatura do reator: %.2f C\n", temperaturaReator);
-    else
-      Serial.println("Temperatura do reator: SEM LEITURA");
+    if (!isnan(tensao)) LOGF("Tensao: %.1f V\n", tensao);
+    else LOGLN("Tensao: SEM LEITURA");
 
-    if (!isnan(tensao))
-      Serial.printf("Tensao: %.1f V\n", tensao);
-    else
-      Serial.println("Tensao: SEM LEITURA");
-
-    if (!isnan(corrente))
-      Serial.printf("Corrente: %.3f A\n", corrente);
-    else
-      Serial.println("Corrente: SEM LEITURA");
-
-    Serial.println("============================================");
+    if (!isnan(corrente)) LOGF("Corrente: %.3f A\n", corrente);
+    else LOGLN("Corrente: SEM LEITURA");
+    LOGLN("============================================");
   }
-
-  // ------------------------------------------------------------------------
-  // Mensagem 0x02: energia acumulada (5 bytes)
-  // ------------------------------------------------------------------------
   else if (tipoMensagem == MSG_ENERGIA && mensagem.data_length_code == 5) {
-
     uint32_t energiaRaw =
       (uint32_t)mensagem.data[1] |
       ((uint32_t)mensagem.data[2] << 8) |
       ((uint32_t)mensagem.data[3] << 16) |
       ((uint32_t)mensagem.data[4] << 24);
 
-    energiaConsumida = (energiaRaw == UINT32_MAX)
-                         ? NAN : energiaRaw / 1000.0f;
+    energiaConsumida = (energiaRaw == UINT32_MAX) ? NAN : energiaRaw / 1000.0f;
 
-    recebeuEnergia = true;
-    ultimaMensagemEnergia = agora;
     ultimaMensagemAquecimento = agora;
     desconexaoInformada = false;
 
-    if (!isnan(energiaConsumida))
-      Serial.printf("Energia acumulada: %.3f kWh\n", energiaConsumida);
-    else
-      Serial.println("Energia acumulada: SEM LEITURA");
+    if (!isnan(energiaConsumida)) LOGF("Energia acumulada: %.3f kWh\n", energiaConsumida);
+    else LOGLN("Energia acumulada: SEM LEITURA");
   }
 }
 
-// ======================== RECEPCAO QUEIMAGAS ===============================
-void receberQueimagas(const twai_message_t &mensagem) {
+// ========================== RECEPCAO BALANCA ===============================
+void receberMassa(const twai_message_t &mensagem) {
+  if (mensagem.extd || mensagem.rtr || mensagem.data_length_code != 4) return;
 
-  if (mensagem.identifier != CAN_ID_QUEIMAGAS) return;
+  float valor;
+  memcpy(&valor, mensagem.data, sizeof(float));
+
+  massaKg = (isnan(valor) || isinf(valor)) ? NAN : valor;
+
+  ultimaMensagemMassa = millis();
+  desconexaoMassaInformada = false;
+
+  if (!isnan(massaKg)) LOGF("Massa (bio-oleo): %.3f kg\n", massaKg);
+  else LOGLN("Massa (bio-oleo): SEM LEITURA");
+}
+
+// ======================== RECEPCAO QUEIMAGAS ===============================
+// ATENCAO: aqui os dados sao lidos em BIG-ENDIAN (byte mais significativo
+// primeiro), diferente das outras escravas. Confirme no codigo da escrava.
+void receberQueimagas(const twai_message_t &mensagem) {
   if (mensagem.extd || mensagem.rtr || mensagem.data_length_code != 5) return;
 
   uint8_t tipoMensagem = mensagem.data[0];
   uint32_t agora = millis();
 
-  // ------------------------------------------------------------------------
-  // Mensagem 0x01: temperatura da agua, presenca de gas e presenca de chama
-  // ------------------------------------------------------------------------
   if (tipoMensagem == MSG_QUEIMAGAS_MEDIDAS) {
-
     uint16_t temperaturaBits =
       ((uint16_t)mensagem.data[1] << 8) |
       (uint16_t)mensagem.data[2];
-
     int16_t temperaturaRaw = (int16_t)temperaturaBits;
 
-    temperaturaAgua = (temperaturaRaw == INT16_MIN)
-                         ? NAN : temperaturaRaw / 100.0f;
+    temperaturaAgua = (temperaturaRaw == INT16_MIN) ? NAN : temperaturaRaw / 100.0f;
+    presencaGas   = (mensagem.data[3] <= 1) ? (int8_t)mensagem.data[3] : -1;
+    presencaChama = (mensagem.data[4] <= 1) ? (int8_t)mensagem.data[4] : -1;
 
-    presencaGas = (mensagem.data[3] <= 1)
-                    ? (int8_t)mensagem.data[3] : -1;
-
-    presencaChama = (mensagem.data[4] <= 1)
-                      ? (int8_t)mensagem.data[4] : -1;
-
-    recebeuMedidasQueimagas = true;
     ultimaMensagemQueimagas = agora;
     desconexaoQueimagasInformada = false;
 
-    Serial.println();
-    Serial.println("========== QUEIMAGAS / MEDIDAS ==========");
+    LOGLN("\n========== QUEIMAGAS / MEDIDAS ==========");
+    if (!isnan(temperaturaAgua)) LOGF("Temperatura da agua: %.2f C\n", temperaturaAgua);
+    else LOGLN("Temperatura da agua: SEM LEITURA");
 
-    if (!isnan(temperaturaAgua))
-      Serial.printf("Temperatura da agua: %.2f C\n", temperaturaAgua);
-    else
-      Serial.println("Temperatura da agua: SEM LEITURA");
+    if (presencaGas == 1) LOGLN("Presenca de gas: Sim");
+    else if (presencaGas == 0) LOGLN("Presenca de gas: Nao");
+    else LOGLN("Presenca de gas: DADO INVALIDO");
 
-    if (presencaGas == 1)
-      Serial.println("Presenca de gas: Yes");
-    else if (presencaGas == 0)
-      Serial.println("Presenca de gas: No");
-    else
-      Serial.println("Presenca de gas: DADO INVALIDO");
-
-    if (presencaChama == 1)
-      Serial.println("Presenca de chama: Yes");
-    else if (presencaChama == 0)
-      Serial.println("Presenca de chama: No");
-    else
-      Serial.println("Presenca de chama: DADO INVALIDO");
-
-    Serial.println("==========================================");
+    if (presencaChama == 1) LOGLN("Presenca de chama: Sim");
+    else if (presencaChama == 0) LOGLN("Presenca de chama: Nao");
+    else LOGLN("Presenca de chama: DADO INVALIDO");
+    LOGLN("==========================================");
   }
-
-  // ------------------------------------------------------------------------
-  // Mensagem 0x02: calor em joules
-  // ------------------------------------------------------------------------
   else if (tipoMensagem == MSG_QUEIMAGAS_CALOR) {
-
     uint32_t calorRaw =
       ((uint32_t)mensagem.data[1] << 24) |
       ((uint32_t)mensagem.data[2] << 16) |
@@ -449,106 +478,109 @@ void receberQueimagas(const twai_message_t &mensagem) {
       (uint32_t)mensagem.data[4];
 
     calorValido = (calorRaw != UINT32_MAX);
-
     if (calorValido) {
       calorJoules = calorRaw;
     }
 
-    recebeuCalorQueimagas = true;
     ultimaMensagemQueimagas = agora;
     desconexaoQueimagasInformada = false;
 
-    if (calorValido)
-      Serial.printf("Calor: %lu J\n", (unsigned long)calorJoules);
-    else
-      Serial.println("Calor: SEM LEITURA");
+    if (calorValido) LOGF("Calor: %lu J\n", (unsigned long)calorJoules);
+    else LOGLN("Calor: SEM LEITURA");
   }
 }
 
 // ======================== PROCESSAMENTO CAN =================================
 void processarMensagensCAN() {
-
   if (!canOk) return;
 
   twai_message_t mensagem;
 
   while (twai_receive(&mensagem, 0) == ESP_OK) {
-
-    if (mensagem.identifier == CAN_ID_TEMPERATURA) {
-      receberTemperatura(mensagem);
-    }
-
-    else if (mensagem.identifier == CAN_ID_AQUECIMENTO) {
-      receberAquecimento(mensagem);
-    }
-
-    else if (mensagem.identifier == CAN_ID_QUEIMAGAS) {
-      receberQueimagas(mensagem);
-    }
-
-    else {
-      // Qualquer outro ID (ex.: 0x123 de outra placa de teste)
-      Serial.printf("RX id=0x%X dado=%d\n", (unsigned)mensagem.identifier,
-                    mensagem.data_length_code > 0 ? mensagem.data[0] : 0);
+    switch (mensagem.identifier) {
+      case CAN_ID_TEMPERATURA: receberTemperatura(mensagem); break;
+      case CAN_ID_AQUECIMENTO: receberAquecimento(mensagem); break;
+      case CAN_ID_MASSA:       receberMassa(mensagem);       break;
+      case CAN_ID_QUEIMAGAS:   receberQueimagas(mensagem);   break;
+      default:
+        // Qualquer outro ID (ex.: 0x123 de outra placa de teste)
+        LOGF("RX id=0x%X dado=%d\n", (unsigned)mensagem.identifier,
+             mensagem.data_length_code > 0 ? mensagem.data[0] : 0);
+        break;
     }
   }
 }
 
-// ============================== MONITOR =====================================
-void monitorarConexaoCAN() {
+// Quadro de teste do barramento (so quando ENVIAR_TESTE = true)
+void enviarTeste() {
+  if (!ENVIAR_TESTE || !canOk) return;
 
+  static uint8_t contador = 0;
+  static uint32_t ultimoEnvio = 0;
+  uint32_t agora = millis();
+  if (agora - ultimoEnvio < INTERVALO_TX_MS) return;
+  ultimoEnvio = agora;
+
+  twai_message_t m = {};
+  m.identifier = CAN_ID_TESTE;
+  m.data_length_code = 1;
+  m.data[0] = contador++;
+
+  // sem espera: a recepcao das escravas nao para enquanto o quadro sai
+  esp_err_t resultado = twai_transmit(&m, 0);
+  LOGF("TX: %s\n", esp_err_to_name(resultado));
+  (void)resultado;  // no modo JSON o LOGF nao imprime
+}
+
+// ============================== MONITOR =====================================
+void verificarTimeout(uint32_t ultimaMensagem, bool &informado,
+                      const char* aviso, uint32_t agora) {
+  if (ultimaMensagem != 0 &&
+      agora - ultimaMensagem > TIMEOUT_CAN_MS &&
+      !informado) {
+    LOGLN(aviso);
+    informado = true;
+  }
+}
+
+void monitorarConexaoCAN() {
   if (!canOk) return;
 
-  // ----------------------- TEMPERATURA -------------------------------------
-  if (ultimaMensagemTemperatura != 0 &&
-      millis() - ultimaMensagemTemperatura > TIMEOUT_CAN_MS &&
-      !desconexaoTemperaturaInformada) {
+  uint32_t agora = millis();
 
-    Serial.println("[CAN] ATENCAO: sem comunicacao com a escrava Temperatura (ID 0x100).");
-    desconexaoTemperaturaInformada = true;
-  }
-
-  // ----------------------- AQUECIMENTO -------------------------------------
-  if (ultimaMensagemAquecimento != 0 &&
-      millis() - ultimaMensagemAquecimento > TIMEOUT_CAN_MS &&
-      !desconexaoInformada) {
-
-    Serial.println("[CAN] ATENCAO: sem comunicacao com a escrava de aquecimento (ID 0x200).");
-    desconexaoInformada = true;
-  }
-
-  // ----------------------- QUEIMAGAS ---------------------------------------
-  if (ultimaMensagemQueimagas != 0 &&
-      millis() - ultimaMensagemQueimagas > TIMEOUT_CAN_MS &&
-      !desconexaoQueimagasInformada) {
-
-    Serial.println("[CAN] ATENCAO: sem comunicacao com a escrava de Queimagas (ID 0x600).");
-    desconexaoQueimagasInformada = true;
-  }
+  verificarTimeout(ultimaMensagemTemperatura, desconexaoTemperaturaInformada,
+    "[CAN] ATENCAO: sem comunicacao com a escrava Temperatura (ID 0x100).", agora);
+  verificarTimeout(ultimaMensagemAquecimento, desconexaoInformada,
+    "[CAN] ATENCAO: sem comunicacao com a escrava de aquecimento (ID 0x200).", agora);
+  verificarTimeout(ultimaMensagemMassa, desconexaoMassaInformada,
+    "[CAN] ATENCAO: sem comunicacao com a escrava da Balanca (ID 0x500).", agora);
+  verificarTimeout(ultimaMensagemQueimagas, desconexaoQueimagasInformada,
+    "[CAN] ATENCAO: sem comunicacao com a escrava de Queimagas (ID 0x600).", agora);
 }
 
 // ================================= SETUP ==================================
 void setup() {
-
   Serial.begin(115200);
   delay(500);
 
-  Serial.println();
-  Serial.println("============================================");
-  Serial.println("       ESP32 MESTRA - SUPERVISOR CAN");
-  Serial.println("============================================");
+  LOGLN("");
+  LOGLN("============================================");
+  LOGLN("       ESP32 MESTRA - SUPERVISOR CAN");
+  LOGLN("============================================");
 
   canOk = iniciarCAN();
+  ultimaTentativaInitCAN = millis();
+  if (!canOk) {
+    LOGLN("[CAN] Falha na inicializacao. Verifique pinos e transceiver.");
+    LOGLN("[CAN] Nova tentativa a cada 5 s.");
+  }
 }
 
 // ================================= LOOP ===================================
 void loop() {
-
-  if (!canOk) return;
-
-  enviarTeste();
   processarMensagensCAN();
+  enviarTeste();
+  verificarBarramentoCAN();
   monitorarConexaoCAN();
-  monitorarBarramento();
-  delay(1);
+  enviarJsonSerial();
 }

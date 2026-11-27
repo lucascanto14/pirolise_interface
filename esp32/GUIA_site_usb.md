@@ -33,7 +33,10 @@ Clique em **Parar simulação** para sair.
 
 ## 4. Usar com a ESP32 de verdade
 
-1. Grave na mestra o código dela, sem mudanças.
+1. Grave na mestra o código `esp32/CAN_mestra/CAN_mestra.ino`. O site funciona com os dois
+   modos de saída (`SAIDA_JSON 0` texto ou `SAIDA_JSON 1` JSON); o texto é o padrão.
+   Ligação do transceiver: **GPIO5 → TX** e **GPIO4 → RX** do transceiver.
+   A escrava de temperatura (0x100) precisa mandar os valores **× 10** (não mais × 100).
 2. Ligue a mestra no computador pelo cabo USB.
 3. **Feche o Monitor Serial da Arduino IDE.** Só um programa pode usar a porta de cada vez.
 4. No site, clique em **Conectar ESP32 (USB)**.
@@ -54,15 +57,18 @@ Ao conectar, a ESP32 pode reiniciar sozinha. Isso é normal.
 | `Tensao: 220.5 V` | Tensão (Grupo 6) |
 | `Corrente: 9.876 A` | Corrente (Grupo 6) |
 | `Energia acumulada: 12.345 kWh` | Energia Acumulada (Grupo 6) |
+| `Massa (bio-oleo): 1.234 kg` | Massa de bio-óleo e gráfico (Grupo 8, escrava Balança 0x500) |
+| `Presenca de gas: Sim` / `Nao` | Presença de gás / chama (Queimagas) |
 | `... SEM LEITURA` | O valor aparece como "—" |
 | `[CAN] ATENCAO: sem comunicacao ...` | Alerta vermelho no Grupo 6 |
 | `[CAN] Falha na inicializacao ...` | Alerta vermelho no painel de conexão |
-| `Falha ao iniciar TWAI` | Alerta vermelho no painel de conexão |
+| `[CAN] Erro ao instalar driver ...` | Alerta vermelho no painel de conexão (some quando a mestra imprime `[CAN] Interface iniciada`) |
+| Linha JSON `{"can_ok":...}` (modo `SAIDA_JSON 1`) | Todos os valores acima, uma vez por segundo |
 | `estado=1 txErr=0 rxErr=0` | Quadro "Barramento CAN" (OK, BUS-OFF, RECUPERANDO, PARADO e contadores de erro) |
-| `TX: ESP_OK` | "Último envio" no quadro Barramento CAN |
-| `RX id=0x123 dado=42` | "Teste recebido" no quadro Barramento CAN (qualquer ID fora de 0x100/0x200/0x600) |
+| `TX: ESP_OK` | "Último envio" no quadro Barramento CAN (só com `ENVIAR_TESTE = true`) |
+| `RX id=0x123 dado=42` | "Teste recebido" no quadro Barramento CAN (qualquer ID fora de 0x100/0x200/0x500/0x600) |
 
-A potência é calculada no site (tensão × corrente). Nitrogênio, volume do gás, bio-óleo e queima
+A potência é calculada no site (tensão × corrente). Nitrogênio e volume do gás
 mostram "—" porque ainda não há escrava para eles.
 
 Ligar/desligar e o setpoint não são enviados ao reator: a mestra atual só envia leituras.
