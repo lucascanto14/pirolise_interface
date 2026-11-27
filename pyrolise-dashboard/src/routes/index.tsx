@@ -18,6 +18,9 @@ import {
   PlayCircle,
   Download,
   RotateCcw,
+  Play,
+  Square,
+  Circle,
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -87,6 +90,48 @@ const UNIDADES = {
 };
 
 type SensorName = keyof typeof UNIDADES;
+
+// Colunas do CSV da coleta (Iniciar/Parar). Nitrogênio e volume do gás ficam de fora
+// enquanto não houver escrava para eles.
+const COLUNAS_COLETA: { sensor: SensorName; nome: string }[] = [
+  ...Array.from({ length: 10 }, (_, i) => ({
+    sensor: `t${i + 1}` as SensorName,
+    nome: `T${i + 1}_C`,
+  })),
+  { sensor: "dht22", nome: "DHT22_C" },
+  { sensor: "temperatura", nome: "temp_reator_C" },
+  { sensor: "tensao", nome: "tensao_V" },
+  { sensor: "corrente", nome: "corrente_A" },
+  { sensor: "energia", nome: "energia_kWh" },
+  { sensor: "temperaturaAgua", nome: "temp_agua_C" },
+  { sensor: "presencaGas", nome: "gas_1sim_0nao" },
+  { sensor: "presencaChama", nome: "chama_1sim_0nao" },
+  { sensor: "calor", nome: "calor_J" },
+  { sensor: "massa", nome: "massa_bio_oleo_kg" },
+];
+
+const INTERVALOS_COLETA = [1, 2, 5, 10]; // segundos entre linhas do CSV
+
+// número no formato do Excel em português (vírgula decimal); vazio = sem leitura
+function numCsv(v: number | null | undefined) {
+  return v === null || v === undefined ? "" : String(v).replace(".", ",");
+}
+
+function baixarArquivo(conteudo: string, nome: string) {
+  // BOM para o Excel abrir os acentos certo
+  const blob = new Blob(["\ufeff" + conteudo], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = nome;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function carimbo(d: Date) {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+}
 const SENSORES = Object.keys(UNIDADES) as SensorName[];
 
 const TERMOPARES: { sensor: SensorName; rotulo: string }[] = [
@@ -401,6 +446,97 @@ function Dashboard() {
   );
 
   const online = conn === "conectado" || conn === "simulacao";
+
+  // ---------------- Coleta de dados (Iniciar / Parar -> CSV) ----------------
+  const valoresRef = useRef(valores);
+  useEffect(() => {
+    valoresRef.current = valores;
+  }, [valores]);
+  const [coletando, setColetando] = useState(false);
+  const [intervaloColeta, setIntervaloColeta] = useState(1);
+  const [duracaoMin, setDuracaoMin] = useState(0); // 0 = sem limite
+  const inicioColetaRef = useRef<Date | null>(null);
+  const linhasColetaRef = useRef<string[]>([]);
+  const [ultimaColeta, setUltimaColeta] = useState<{
+    nome: string;
+    csv: string;
+    linhas: number;
+  } | null>(null);
+
+  const montarCsvColeta = () => {
+    const cab = ["data_hora", "tempo_s", ...COLUNAS_COLETA.map((c) => c.nome), "potencia_W"];
+    return [cab.join(";"), ...linhasColetaRef.current].join("\r\n");
+  };
+
+  const iniciarColeta = () => {
+    linhasColetaRef.current = [];
+    inicioColetaRef.current = new Date();
+    setUltimaColeta(null);
+    zerarHistorico(); // os gráficos do ensaio começam junto com a coleta
+    setColetando(true);
+  };
+
+  const pararColeta = () => {
+    if (!inicioColetaRef.current) return;
+    setColetando(false);
+    const nome = `coleta_${carimbo(inicioColetaRef.current)}.csv`;
+    const csv = montarCsvColeta();
+    setUltimaColeta({ nome, csv, linhas: linhasColetaRef.current.length });
+    baixarArquivo(csv, nome);
+  };
+
+  // grava uma linha a cada intervalo com o último valor de cada sensor
+  useEffect(() => {
+    if (!coletando) return;
+    const gravar = () => {
+      const agora = new Date();
+      const inicio = inicioColetaRef.current ?? agora;
+      const v = valoresRef.current;
+      const pot =
+        v.tensao !== null && v.corrente !== null
+          ? Number((v.tensao * v.corrente).toFixed(1))
+          : null;
+      linhasColetaRef.current.push(
+        [
+          agora.toLocaleString("pt-BR").replace(",", ""),
+          Math.round((agora.getTime() - inicio.getTime()) / 1000),
+          ...COLUNAS_COLETA.map((c) => numCsv(v[c.sensor])),
+          numCsv(pot),
+        ].join(";"),
+      );
+    };
+    gravar();
+    const id = setInterval(gravar, intervaloColeta * 1000);
+    return () => clearInterval(id);
+  }, [coletando, intervaloColeta]);
+
+  const tempoColeta =
+    coletando && inicioColetaRef.current
+      ? Math.max(0, Math.floor((now.getTime() - inicioColetaRef.current.getTime()) / 1000))
+      : 0;
+
+  // timer: para sozinho quando chega na duração escolhida
+  useEffect(() => {
+    if (coletando && duracaoMin > 0 && tempoColeta >= duracaoMin * 60) pararColeta();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coletando, duracaoMin, tempoColeta]);
+
+  // se a ESP32 desconectar, encerra a coleta e salva o que já foi gravado
+  useEffect(() => {
+    if (!online && coletando) pararColeta();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [online]);
+
+  // avisa antes de fechar a página no meio de uma coleta
+  useEffect(() => {
+    if (!coletando) return;
+    const aviso = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", aviso);
+    return () => window.removeEventListener("beforeunload", aviso);
+  }, [coletando]);
 
   // Web Serial só existe no Chrome/Edge (verificado no navegador, não no servidor)
   useEffect(() => {
@@ -836,6 +972,92 @@ function Dashboard() {
               </div>
             </div>
           )}
+
+          {/* COLETA DE DADOS */}
+          <div className="mt-5 border-t border-border pt-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-muted-foreground">
+                {coletando ? (
+                  <Circle className="h-3 w-3 animate-pulse fill-danger text-danger" />
+                ) : (
+                  <Timer className="h-3.5 w-3.5" />
+                )}
+                Coleta de dados
+              </div>
+              <span
+                className={`text-mono text-2xl ${coletando ? "text-danger" : "text-muted-foreground"}`}
+              >
+                {fmtTempo(tempoColeta).padStart(5, "0")}
+                {coletando && duracaoMin > 0 && (
+                  <span className="ml-1 text-xs text-muted-foreground">/ {duracaoMin} min</span>
+                )}
+              </span>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              {coletando ? (
+                <button
+                  onClick={pararColeta}
+                  className="inline-flex items-center gap-2 rounded-xl border border-danger bg-danger/15 px-5 py-2.5 text-sm font-semibold text-danger transition"
+                >
+                  <Square className="h-4 w-4" />
+                  Parar e salvar CSV
+                </button>
+              ) : (
+                <button
+                  onClick={iniciarColeta}
+                  disabled={!online}
+                  title={online ? "" : "Conecte a ESP32 ou use o modo simulação"}
+                  className="inline-flex items-center gap-2 rounded-xl border border-neon bg-neon/15 px-5 py-2.5 text-sm font-semibold text-neon transition disabled:opacity-40"
+                >
+                  <Play className="h-4 w-4" />
+                  Iniciar coleta
+                </button>
+              )}
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                A cada
+                <select
+                  value={intervaloColeta}
+                  onChange={(e) => setIntervaloColeta(Number(e.target.value))}
+                  className="rounded-lg border border-border bg-background/60 px-2 py-1.5 text-mono text-foreground"
+                >
+                  {INTERVALOS_COLETA.map((s) => (
+                    <option key={s} value={s}>
+                      {s} s
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                Parar após
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={duracaoMin}
+                  disabled={coletando}
+                  onChange={(e) => setDuracaoMin(Math.max(0, Number(e.target.value) || 0))}
+                  className="w-16 rounded-lg border border-border bg-background/60 px-2 py-1.5 text-mono text-foreground disabled:opacity-50"
+                />
+                min (0 = sem limite)
+              </label>
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              {coletando
+                ? `Gravando ${linhasColetaRef.current.length} linhas. Ao parar, o arquivo CSV é baixado.`
+                : ultimaColeta
+                  ? `Última coleta: ${ultimaColeta.linhas} linhas em ${ultimaColeta.nome}.`
+                  : "Grava todas as leituras em um CSV (abre no Excel). Os gráficos do ensaio recomeçam junto."}
+              {!coletando && ultimaColeta && (
+                <button
+                  onClick={() => baixarArquivo(ultimaColeta.csv, ultimaColeta.nome)}
+                  className="ml-2 inline-flex items-center gap-1 text-cyan hover:underline"
+                >
+                  <Download className="h-3 w-3" />
+                  Baixar de novo
+                </button>
+              )}
+            </p>
+          </div>
         </div>
 
         <div className="rounded-2xl panel-grad border border-border p-5">
