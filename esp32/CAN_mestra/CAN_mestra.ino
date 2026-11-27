@@ -6,6 +6,7 @@
    Escravas:
      Temperatura: ID 0x100 (10 MAX6675 + DHT22)
      Aquecimento: ID 0x200
+     Temp. internas: ID 0x300 (10 termopares + DHT22, mesmo formato da 0x100)
      Balanca:     ID 0x500 (massa do bio-oleo)
      Queimagas:   ID 0x600
 
@@ -17,7 +18,7 @@
      1 = uma linha JSON por segundo com todos os dados, para um programa
          ou pagina no notebook ler pela porta serial
 
-   PROTOCOLO TEMPERATURA (ID 0x100):
+   PROTOCOLO TEMPERATURA (ID 0x100 e ID 0x300 - mesmo formato):
      DLC 7 | byte0 = tipo (0x01..0x04) | 3 x int16 little-endian
      Escala: valor * 10  (0,1 C de resolucao, faixa -3276,7 a +3276,7 C)
      INT16_MIN (0x8000) = sem leitura
@@ -29,7 +30,7 @@
    LINHAS LIDAS PELO SITE (pyrolise-dashboard), alem das medidas:
      "estado=N txErr=A rxErr=B"  estado do barramento, a cada 1 s
      "TX: ESP_OK"                resultado do quadro de teste (se ENVIAR_TESTE)
-     "RX id=0x123 dado=42"       qualquer ID fora de 0x100/0x200/0x500/0x600
+     "RX id=0x123 dado=42"       qualquer ID fora de 0x100/0x200/0x300/0x500/0x600
    No modo JSON o site le a linha JSON (o estado do barramento vai junto).
   ============================================================================
 */
@@ -59,6 +60,7 @@ const uint32_t INTERVALO_JSON_MS = 1000;
 
 #define CAN_ID_TEMPERATURA  0x100
 #define CAN_ID_AQUECIMENTO  0x200
+#define CAN_ID_TEMP_INTERNA 0x300
 #define CAN_ID_MASSA        0x500
 #define CAN_ID_QUEIMAGAS    0x600
 
@@ -99,6 +101,14 @@ float temperaturas[11] = {
 
 uint32_t ultimaMensagemTemperatura = 0;
 bool desconexaoTemperaturaInformada = false;
+
+// ----------------------- Temperaturas internas (ID 0x300) ------------------
+float temperaturasInternas[11] = {
+  NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN
+};
+
+uint32_t ultimaMensagemTempInterna = 0;
+bool desconexaoTempInternaInformada = false;
 
 // ----------------------- Aquecimento (ID 0x200) ----------------------------
 float temperaturaReator = NAN;
@@ -151,7 +161,7 @@ bool estaOnline(uint32_t ultimaMensagem, uint32_t agora) {
 
 String gerarJsonTelemetria() {
   String json;
-  json.reserve(800);
+  json.reserve(1200);
   json = "{";
 
   uint32_t agora = millis();
@@ -179,6 +189,18 @@ String gerarJsonTelemetria() {
   }
   json += "],\"dht22\":";
   json += floatParaJson(temperaturas[10], 1);
+  json += "},";
+
+  // Temperaturas internas (ID 0x300)
+  json += "\"temperatura_interna\":{\"online\":";
+  json += (estaOnline(ultimaMensagemTempInterna, agora) ? "true" : "false");
+  json += ",\"termopares\":[";
+  for (int i = 0; i < 10; i++) {
+    json += floatParaJson(temperaturasInternas[i], 1);
+    if (i < 9) json += ",";
+  }
+  json += "],\"dht22\":";
+  json += floatParaJson(temperaturasInternas[10], 1);
   json += "},";
 
   // Aquecimento (ID 0x200)
@@ -260,6 +282,7 @@ bool iniciarCAN() {
   LOGLN("[CAN] Aguardando:");
   LOGLN("  ID 0x100 - Temperatura");
   LOGLN("  ID 0x200 - Aquecimento");
+  LOGLN("  ID 0x300 - Temperaturas internas");
   LOGLN("  ID 0x500 - Balanca");
   LOGLN("  ID 0x600 - Queimagas");
   return true;
@@ -322,7 +345,14 @@ void imprimirTemperatura(const char* nome, float valor) {
   else LOGF("%s: SEM LEITURA\n", nome);
 }
 
-void receberTemperatura(const twai_message_t &mensagem) {
+// Usada pelas duas placas de termopares (0x100 e 0x300), que tem o mesmo
+// formato de quadro. Cada uma grava no seu proprio vetor.
+// O site separa as duas pelo titulo do bloco ("TEMPERATURAS" ou "TEMP. INTERNAS").
+void receberQuadroTemperaturas(const twai_message_t &mensagem,
+                               float destino[11],
+                               uint32_t &ultimaMensagem,
+                               bool &desconexaoInformadaFlag,
+                               const char* titulo) {
   if (mensagem.extd || mensagem.rtr || mensagem.data_length_code != 7) return;
 
   uint8_t tipoMensagem = mensagem.data[0];
@@ -343,24 +373,38 @@ void receberTemperatura(const twai_message_t &mensagem) {
   int quantidade = (tipoMensagem == MSG_TEMPERATURAS_4) ? 2 : 3;
 
   for (int i = 0; i < quantidade; i++) {
-    temperaturas[base + i] = valores[i];
+    destino[base + i] = valores[i];
   }
 
-  LOGF("\n========== TEMPERATURAS / QUADRO %u ==========\n", tipoMensagem);
+  LOGF("\n========== %s / QUADRO %u ==========\n", titulo, tipoMensagem);
   for (int i = 0; i < quantidade; i++) {
     int indice = base + i;
     if (indice == 10) {
-      imprimirTemperatura("DHT22", temperaturas[indice]);
+      imprimirTemperatura("DHT22", destino[indice]);
     } else {
       char nome[6];
       snprintf(nome, sizeof(nome), "T%d", indice + 1);
-      imprimirTemperatura(nome, temperaturas[indice]);
+      imprimirTemperatura(nome, destino[indice]);
     }
   }
   LOGLN("==============================================");
 
-  ultimaMensagemTemperatura = millis();
-  desconexaoTemperaturaInformada = false;
+  ultimaMensagem = millis();
+  desconexaoInformadaFlag = false;
+}
+
+void receberTemperatura(const twai_message_t &mensagem) {
+  receberQuadroTemperaturas(mensagem, temperaturas,
+                            ultimaMensagemTemperatura,
+                            desconexaoTemperaturaInformada,
+                            "TEMPERATURAS");
+}
+
+void receberTemperaturaInterna(const twai_message_t &mensagem) {
+  receberQuadroTemperaturas(mensagem, temperaturasInternas,
+                            ultimaMensagemTempInterna,
+                            desconexaoTempInternaInformada,
+                            "TEMP. INTERNAS");
 }
 
 // ============================ RECEPCAO AQUECIMENTO ==========================
@@ -500,6 +544,7 @@ void processarMensagensCAN() {
     switch (mensagem.identifier) {
       case CAN_ID_TEMPERATURA: receberTemperatura(mensagem); break;
       case CAN_ID_AQUECIMENTO: receberAquecimento(mensagem); break;
+      case CAN_ID_TEMP_INTERNA: receberTemperaturaInterna(mensagem); break;
       case CAN_ID_MASSA:       receberMassa(mensagem);       break;
       case CAN_ID_QUEIMAGAS:   receberQueimagas(mensagem);   break;
       default:
@@ -552,6 +597,8 @@ void monitorarConexaoCAN() {
     "[CAN] ATENCAO: sem comunicacao com a escrava Temperatura (ID 0x100).", agora);
   verificarTimeout(ultimaMensagemAquecimento, desconexaoInformada,
     "[CAN] ATENCAO: sem comunicacao com a escrava de aquecimento (ID 0x200).", agora);
+  verificarTimeout(ultimaMensagemTempInterna, desconexaoTempInternaInformada,
+    "[CAN] ATENCAO: sem comunicacao com a escrava Temp. internas (ID 0x300).", agora);
   verificarTimeout(ultimaMensagemMassa, desconexaoMassaInformada,
     "[CAN] ATENCAO: sem comunicacao com a escrava da Balanca (ID 0x500).", agora);
   verificarTimeout(ultimaMensagemQueimagas, desconexaoQueimagasInformada,
