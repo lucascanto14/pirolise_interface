@@ -49,6 +49,22 @@ Ao conectar, a ESP32 pode reiniciar sozinha. Isso é normal.
 
 ---
 
+## 5. Coletar os dados do ensaio (CSV)
+
+No painel de conexão, em **Coleta de dados**:
+
+1. Conecte a ESP32 (ou ligue o modo simulação).
+2. Escolha de quantos em quantos segundos gravar (**A cada** 1, 2, 5 ou 10 s).
+3. Se quiser que pare sozinho, preencha **Parar após** em minutos (0 = só para quando você clicar).
+4. Clique em **Iniciar coleta**. O cronômetro vermelho mostra o tempo, e os gráficos do ensaio recomeçam junto.
+5. Clique em **Parar e salvar CSV**. O navegador baixa `coleta_AAAA-MM-DD_HH-MM-SS.csv`.
+
+O CSV tem uma linha por intervalo com data/hora, tempo em segundos e o último valor de cada sensor
+(T1 a T10, DHT22, reator, tensão, corrente, energia, água, gás, chama, calor, bio-óleo e potência).
+Usa `;` e vírgula decimal, então abre direto no Excel. Célula vazia = sem leitura.
+Se a ESP32 desconectar no meio, a coleta para e o arquivo é salvo com o que já foi gravado.
+O botão **Baixar de novo** baixa a última coleta outra vez.
+
 ## O que aparece na tela
 
 | Linha que a mestra imprime | Onde aparece no site |
