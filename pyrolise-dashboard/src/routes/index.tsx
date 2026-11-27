@@ -59,8 +59,9 @@ const BAUD_RATE = 115200;
 // Unidades de cada sensor, agrupadas pela escrava que envia o dado.
 //   Temperatura (ID 0x100): T1 a T10 (MAX6675) e DHT22
 //   Aquecimento (ID 0x200): temperatura do reator, tensão, corrente e energia
+//   Balança     (ID 0x500): massa do bio-óleo
 //   Queimagas   (ID 0x600): temperatura da água, presença de gás e de chama, calor
-// Nitrogênio, volume do gás e bio-óleo ainda não têm escrava (aparecem como "—").
+// Nitrogênio e volume do gás ainda não têm escrava (aparecem como "—").
 const UNIDADES = {
   t1: "°C",
   t2: "°C",
@@ -83,7 +84,7 @@ const UNIDADES = {
   calor: "J",
   nitrogenio: "L/min",
   volumeGas: "L",
-  biooleo: "ml",
+  massa: "kg",
 };
 
 type SensorName = keyof typeof UNIDADES;
@@ -97,10 +98,10 @@ const TERMOPARES: { sensor: SensorName; rotulo: string }[] = [
   { sensor: "dht22", rotulo: "DHT22" },
 ];
 
-type Escrava = "temperatura" | "aquecimento" | "queimagas";
+type Escrava = "temperatura" | "aquecimento" | "balanca" | "queimagas";
 
 // Texto que a mestra imprime antes do ":" em cada linha -> sensor no site e escrava de origem.
-// Ex.: "T3: 251.25 C", "Tensao: SEM LEITURA", "Presenca de chama: Yes", "Calor: 1200 J"
+// Ex.: "T3: 251.2 C", "Tensao: SEM LEITURA", "Presenca de chama: Sim", "Calor: 1200 J"
 const ROTULOS_SERIAL: Record<string, { sensor: SensorName; escrava: Escrava }> = {
   ...Object.fromEntries(
     TERMOPARES.map(({ sensor, rotulo }) => [rotulo, { sensor, escrava: "temperatura" as Escrava }]),
@@ -109,6 +110,7 @@ const ROTULOS_SERIAL: Record<string, { sensor: SensorName; escrava: Escrava }> =
   Tensao: { sensor: "tensao", escrava: "aquecimento" },
   Corrente: { sensor: "corrente", escrava: "aquecimento" },
   "Energia acumulada": { sensor: "energia", escrava: "aquecimento" },
+  "Massa (bio-oleo)": { sensor: "massa", escrava: "balanca" },
   "Temperatura da agua": { sensor: "temperaturaAgua", escrava: "queimagas" },
   "Presenca de gas": { sensor: "presencaGas", escrava: "queimagas" },
   "Presenca de chama": { sensor: "presencaChama", escrava: "queimagas" },
@@ -119,6 +121,7 @@ const ROTULOS_SERIAL: Record<string, { sensor: SensorName; escrava: Escrava }> =
 const ID_ESCRAVA: Record<string, Escrava> = {
   "0x100": "temperatura",
   "0x200": "aquecimento",
+  "0x500": "balanca",
   "0x600": "queimagas",
 };
 
@@ -126,6 +129,7 @@ type EventoSerial =
   | { tipo: "valor"; sensor: SensorName; escrava: Escrava; valor: number | null }
   | { tipo: "escravaOffline"; escrava: Escrava }
   | { tipo: "erroCan" }
+  | { tipo: "canOk" }
   | { tipo: "barramento"; estado: number; txErr: number; rxErr: number }
   | { tipo: "tx"; resultado: string }
   | { tipo: "rx"; id: string; dado: number };
@@ -152,6 +156,7 @@ function lerLinha(linha: string): EventoSerial | null {
   ) {
     return { tipo: "erroCan" };
   }
+  if (linha.includes("[CAN] Interface iniciada")) return { tipo: "canOk" };
   // Teste do barramento: "estado=1 txErr=0 rxErr=0", "TX: ESP_OK", "RX id=0x123 dado=42"
   const st = linha.match(/^estado=(\d+)\s+txErr=(\d+)\s+rxErr=(\d+)/);
   if (st) return { tipo: "barramento", estado: +st[1], txErr: +st[2], rxErr: +st[3] };
@@ -164,14 +169,93 @@ function lerLinha(linha: string): EventoSerial | null {
   const destino = ROTULOS_SERIAL[m[1].trim()];
   if (!destino) return null;
   const texto = m[2].trim();
-  // "Yes"/"No" da Queimagas viram 1/0; "SEM LEITURA" e "DADO INVALIDO" ficam sem valor
-  if (texto === "Yes") return { tipo: "valor", ...destino, valor: 1 };
-  if (texto === "No") return { tipo: "valor", ...destino, valor: 0 };
+  // "Sim"/"Nao" da Queimagas viram 1/0 (aceita também "Yes"/"No" da mestra antiga);
+  // "SEM LEITURA" e "DADO INVALIDO" ficam sem valor
+  if (texto === "Sim" || texto === "Yes") return { tipo: "valor", ...destino, valor: 1 };
+  if (texto === "Nao" || texto === "No") return { tipo: "valor", ...destino, valor: 0 };
   if (texto.startsWith("SEM LEITURA") || texto.startsWith("DADO INVALIDO")) {
     return { tipo: "valor", ...destino, valor: null };
   }
   const valor = parseFloat(texto);
   return Number.isFinite(valor) ? { tipo: "valor", ...destino, valor } : null;
+}
+
+// Modo JSON da mestra (SAIDA_JSON 1): uma linha por segundo com tudo.
+// Ex.: {"can_ok":true,"barramento":{...},"temperatura":{"online":true,"termopares":[...],"dht22":27.1},...}
+type JsonMestra = {
+  can_ok?: boolean;
+  barramento?: { estado: number | null; tx_err: number; rx_err: number };
+  temperatura?: { online: boolean; termopares?: (number | null)[]; dht22?: number | null };
+  aquecimento?: {
+    online: boolean;
+    temperatura_reator?: number | null;
+    tensao?: number | null;
+    corrente?: number | null;
+    energia_kwh?: number | null;
+  };
+  balanca?: { online: boolean; massa_kg?: number | null };
+  queimagas?: {
+    online: boolean;
+    temperatura_agua?: number | null;
+    presenca_gas?: number;
+    presenca_chama?: number;
+    calor_joules?: number | null;
+  };
+};
+
+function lerJson(linha: string): EventoSerial[] {
+  let d: JsonMestra;
+  try {
+    d = JSON.parse(linha) as JsonMestra;
+  } catch {
+    return [];
+  }
+  const eventos: EventoSerial[] = [];
+  if (d.can_ok === false) eventos.push({ tipo: "erroCan" });
+  if (d.can_ok === true) eventos.push({ tipo: "canOk" });
+  const b = d.barramento;
+  if (b && b.estado !== null && b.estado !== undefined) {
+    eventos.push({ tipo: "barramento", estado: b.estado, txErr: b.tx_err, rxErr: b.rx_err });
+  }
+  const num = (v: number | null | undefined) =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
+  const bool01 = (v: number | undefined) => (v === 0 || v === 1 ? v : null);
+  const grupo = (
+    escrava: Escrava,
+    online: boolean | undefined,
+    valores: [SensorName, number | null][],
+  ) => {
+    if (online === undefined) return;
+    // escrava sem comunicação: a mestra ainda manda o último valor, que fica velho
+    if (!online) {
+      eventos.push({ tipo: "escravaOffline", escrava });
+      return;
+    }
+    for (const [sensor, valor] of valores) eventos.push({ tipo: "valor", sensor, escrava, valor });
+  };
+  const t = d.temperatura;
+  grupo("temperatura", t?.online, [
+    ...TERMOPARES.slice(0, 10).map(
+      ({ sensor }, i) => [sensor, num(t?.termopares?.[i])] as [SensorName, number | null],
+    ),
+    ["dht22", num(t?.dht22)],
+  ]);
+  const a = d.aquecimento;
+  grupo("aquecimento", a?.online, [
+    ["temperatura", num(a?.temperatura_reator)],
+    ["tensao", num(a?.tensao)],
+    ["corrente", num(a?.corrente)],
+    ["energia", num(a?.energia_kwh)],
+  ]);
+  grupo("balanca", d.balanca?.online, [["massa", num(d.balanca?.massa_kg)]]);
+  const q = d.queimagas;
+  grupo("queimagas", q?.online, [
+    ["temperaturaAgua", num(q?.temperatura_agua)],
+    ["presencaGas", bool01(q?.presenca_gas)],
+    ["presencaChama", bool01(q?.presenca_chama)],
+    ["calor", num(q?.calor_joules)],
+  ]);
+  return eventos;
 }
 
 // Tipos mínimos da Web Serial API (o TypeScript ainda não traz por padrão)
@@ -279,6 +363,7 @@ function Dashboard() {
   const [escravaOnline, setEscravaOnline] = useState<Record<Escrava, boolean | null>>({
     temperatura: null,
     aquecimento: null,
+    balanca: null,
     queimagas: null,
   });
 
@@ -318,15 +403,26 @@ function Dashboard() {
   }, [online]);
 
   const processarLinha = (linha: string) => {
-    const evento = lerLinha(linha.trim());
-    if (!evento) return;
+    const texto = linha.trim();
+    if (texto.startsWith("{")) {
+      lerJson(texto).forEach(processarEvento);
+      return;
+    }
+    const evento = lerLinha(texto);
+    if (evento) processarEvento(evento);
+  };
 
+  const processarEvento = (evento: EventoSerial) => {
     if (evento.tipo === "escravaOffline") {
       setEscravaOnline((e) => ({ ...e, [evento.escrava]: false }));
       return;
     }
     if (evento.tipo === "erroCan") {
       setErroCan(true);
+      return;
+    }
+    if (evento.tipo === "canOk") {
+      setErroCan(false);
       return;
     }
     if (evento.tipo === "barramento") {
@@ -499,9 +595,10 @@ function Dashboard() {
     let energia = 0;
     let calor = 0;
     let agua = 24;
+    let massa = 0;
     let t = 0;
     const linhaTemp = (rotulo: string, v: number | null) =>
-      processarLinha(v === null ? `${rotulo}: SEM LEITURA` : `${rotulo}: ${v.toFixed(2)} C`);
+      processarLinha(v === null ? `${rotulo}: SEM LEITURA` : `${rotulo}: ${v.toFixed(1)} C`);
     simulacaoRef.current = setInterval(() => {
       t += 1;
       const sp = setpointRef.current;
@@ -538,9 +635,13 @@ function Dashboard() {
       calor += quente ? 800 + Math.round(Math.random() * 100) : 0;
       processarLinha("========== QUEIMAGAS / MEDIDAS ==========");
       processarLinha(`Temperatura da agua: ${agua.toFixed(2)} C`);
-      processarLinha(`Presenca de gas: ${quente ? "Yes" : "No"}`);
-      processarLinha(`Presenca de chama: ${quente ? "Yes" : "No"}`);
+      processarLinha(`Presenca de gas: ${quente ? "Sim" : "Nao"}`);
+      processarLinha(`Presenca de chama: ${quente ? "Sim" : "Nao"}`);
       processarLinha(`Calor: ${calor} J`);
+
+      // Escrava Balança (ID 0x500): bio-óleo condensado acumulando
+      if (quente) massa += 0.002 + Math.random() * 0.001;
+      processarLinha(`Massa (bio-oleo): ${massa.toFixed(3)} kg`);
 
       // Teste do barramento (quadro 0x123 com contador e estado do TWAI)
       processarLinha("TX: ESP_OK");
@@ -1114,17 +1215,24 @@ function Dashboard() {
         </Card>
 
         {/* GRUPO 8 */}
-        <Card tag="Grupo 8" title="Subproduto · Bio-óleo" icon={<Droplets className="h-4 w-4" />}>
+        <Card
+          tag="Grupo 8 · Escrava Balança · ID 0x500"
+          title="Subproduto · Bio-óleo"
+          icon={<Droplets className="h-4 w-4" />}
+        >
+          <AvisoOffline online={escravaOnline.balanca} nome="Balança" />
           <div className="rounded-xl border border-border bg-background/40 p-4">
-            <div className="text-xs uppercase tracking-widest text-muted-foreground">Bio-óleo</div>
+            <div className="text-xs uppercase tracking-widest text-muted-foreground">
+              Massa de bio-óleo
+            </div>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-mono text-4xl text-warn">{fmt(valores.biooleo, 2)}</span>
-              <span className="text-sm text-muted-foreground">{UNIDADES.biooleo}</span>
+              <span className="text-mono text-4xl text-warn">{fmt(valores.massa, 3)}</span>
+              <span className="text-sm text-muted-foreground">{UNIDADES.massa}</span>
             </div>
           </div>
           <div className="h-44">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={series.biooleo} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+              <AreaChart data={series.massa} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
                 <defs>
                   <linearGradient id="gBio" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="var(--warn)" stopOpacity={0.7} />
