@@ -6,7 +6,6 @@
    Escravas:
      Temperatura: ID 0x100 (10 MAX6675 + DHT22)
      Aquecimento: ID 0x200
-     Temp. internas: ID 0x300 (10 termopares + DHT22, mesmo formato da 0x100)
      Balanca:     ID 0x500 (massa do bio-oleo)
      Queimagas:   ID 0x600
 
@@ -18,20 +17,20 @@
      1 = uma linha JSON por segundo com todos os dados, para um programa
          ou pagina no notebook ler pela porta serial
 
-   PROTOCOLO TEMPERATURA (ID 0x100 e ID 0x300 - mesmo formato):
+   PROTOCOLO TEMPERATURA (ID 0x100):
      DLC 7 | byte0 = tipo (0x01..0x04) | 3 x int16 little-endian
      Escala: valor * 10  (0,1 C de resolucao, faixa -3276,7 a +3276,7 C)
      INT16_MIN (0x8000) = sem leitura
      >>> A escrava de temperatura precisa usar a MESMA escala (x10) <<<
 
+   PROTOCOLO AQUECIMENTO (ID 0x200), tudo little-endian:
+     Tipo 0x01, DLC 7: temp. reator int16 (x10) | tensao uint16 (x10) |
+                       corrente uint16 (x1000)
+     Tipo 0x02, DLC 5: energia uint32 (kWh x1000 = Wh)
+     Sem leitura: INT16_MIN (temperatura), UINT16_MAX / UINT32_MAX (demais)
+
    PROTOCOLO BALANCA (ID 0x500):
      DLC 4 | bytes 0..3 = float IEEE-754 (little-endian), massa em kg
-
-   LINHAS LIDAS PELO SITE (pyrolise-dashboard), alem das medidas:
-     "estado=N txErr=A rxErr=B"  estado do barramento, a cada 1 s
-     "TX: ESP_OK"                resultado do quadro de teste (se ENVIAR_TESTE)
-     "RX id=0x123 dado=42"       qualquer ID fora de 0x100/0x200/0x300/0x500/0x600
-   No modo JSON o site le a linha JSON (o estado do barramento vai junto).
   ============================================================================
 */
 
@@ -60,7 +59,6 @@ const uint32_t INTERVALO_JSON_MS = 1000;
 
 #define CAN_ID_TEMPERATURA  0x100
 #define CAN_ID_AQUECIMENTO  0x200
-#define CAN_ID_TEMP_INTERNA 0x300
 #define CAN_ID_MASSA        0x500
 #define CAN_ID_QUEIMAGAS    0x600
 
@@ -78,19 +76,14 @@ const uint32_t INTERVALO_JSON_MS = 1000;
 // Escala das temperaturas da escrava 0x100 (deve ser igual na escrava)
 #define ESCALA_TEMPERATURA  10.0f
 
+// Escala da temperatura do reator da escrava 0x200 (deve ser igual na escrava)
+#define ESCALA_TEMP_REATOR  10.0f
+
 #define CAN_RX_QUEUE_LEN    32
 
 const uint32_t TIMEOUT_CAN_MS            = 3000;
 const uint32_t INTERVALO_CHECK_CAN_MS    = 500;
 const uint32_t INTERVALO_REINIT_CAN_MS   = 5000;
-const uint32_t INTERVALO_STATUS_MS       = 1000;  // linha "estado=..." para o site
-
-// ----------------------- Teste do barramento --------------------------------
-// Quadro de teste ID 0x123 com contador. Use true so para testar o barramento:
-// com a mestra sozinha no fio (sem ACK) ele faz os contadores de erro subirem.
-#define CAN_ID_TESTE        0x123
-const bool     ENVIAR_TESTE     = false;
-const uint32_t INTERVALO_TX_MS  = 500;
 
 // =============================== DADOS ======================================
 
@@ -101,14 +94,6 @@ float temperaturas[11] = {
 
 uint32_t ultimaMensagemTemperatura = 0;
 bool desconexaoTemperaturaInformada = false;
-
-// ----------------------- Temperaturas internas (ID 0x300) ------------------
-float temperaturasInternas[11] = {
-  NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN
-};
-
-uint32_t ultimaMensagemTempInterna = 0;
-bool desconexaoTempInternaInformada = false;
 
 // ----------------------- Aquecimento (ID 0x200) ----------------------------
 float temperaturaReator = NAN;
@@ -142,11 +127,6 @@ uint32_t ultimaVerificacaoCAN = 0;
 uint32_t ultimaTentativaInitCAN = 0;
 uint32_t ultimoEnvioJson = 0;
 
-// ultimo estado lido do driver TWAI (-1 = ainda nao lido)
-int estadoBarramento = -1;
-uint32_t txErrBarramento = 0;
-uint32_t rxErrBarramento = 0;
-
 // ============================ JSON (SAIDA_JSON = 1) =========================
 String floatParaJson(float valor, int casas) {
   if (isnan(valor) || isinf(valor)) {
@@ -161,7 +141,7 @@ bool estaOnline(uint32_t ultimaMensagem, uint32_t agora) {
 
 String gerarJsonTelemetria() {
   String json;
-  json.reserve(1200);
+  json.reserve(800);
   json = "{";
 
   uint32_t agora = millis();
@@ -169,15 +149,6 @@ String gerarJsonTelemetria() {
   json += "\"can_ok\":";
   json += (canOk ? "true" : "false");
   json += ",";
-
-  // Estado do barramento (0 parado, 1 ok, 2 bus-off, 3 recuperando)
-  json += "\"barramento\":{\"estado\":";
-  json += (estadoBarramento < 0 ? String("null") : String(estadoBarramento));
-  json += ",\"tx_err\":";
-  json += String(txErrBarramento);
-  json += ",\"rx_err\":";
-  json += String(rxErrBarramento);
-  json += "},";
 
   // Temperatura (ID 0x100)
   json += "\"temperatura\":{\"online\":";
@@ -191,23 +162,11 @@ String gerarJsonTelemetria() {
   json += floatParaJson(temperaturas[10], 1);
   json += "},";
 
-  // Temperaturas internas (ID 0x300)
-  json += "\"temperatura_interna\":{\"online\":";
-  json += (estaOnline(ultimaMensagemTempInterna, agora) ? "true" : "false");
-  json += ",\"termopares\":[";
-  for (int i = 0; i < 10; i++) {
-    json += floatParaJson(temperaturasInternas[i], 1);
-    if (i < 9) json += ",";
-  }
-  json += "],\"dht22\":";
-  json += floatParaJson(temperaturasInternas[10], 1);
-  json += "},";
-
   // Aquecimento (ID 0x200)
   json += "\"aquecimento\":{\"online\":";
   json += (estaOnline(ultimaMensagemAquecimento, agora) ? "true" : "false");
   json += ",\"temperatura_reator\":";
-  json += floatParaJson(temperaturaReator, 2);
+  json += floatParaJson(temperaturaReator, 1);
   json += ",\"tensao\":";
   json += floatParaJson(tensao, 1);
   json += ",\"corrente\":";
@@ -282,7 +241,6 @@ bool iniciarCAN() {
   LOGLN("[CAN] Aguardando:");
   LOGLN("  ID 0x100 - Temperatura");
   LOGLN("  ID 0x200 - Aquecimento");
-  LOGLN("  ID 0x300 - Temperaturas internas");
   LOGLN("  ID 0x500 - Balanca");
   LOGLN("  ID 0x600 - Queimagas");
   return true;
@@ -306,17 +264,6 @@ void verificarBarramentoCAN() {
 
   twai_status_info_t status;
   if (twai_get_status_info(&status) != ESP_OK) return;
-
-  estadoBarramento = (int)status.state;
-  txErrBarramento = status.tx_error_counter;
-  rxErrBarramento = status.rx_error_counter;
-
-  static uint32_t ultimoStatus = 0;
-  if (agora - ultimoStatus >= INTERVALO_STATUS_MS) {
-    ultimoStatus = agora;
-    LOGF("estado=%d txErr=%lu rxErr=%lu\n", estadoBarramento,
-         (unsigned long)txErrBarramento, (unsigned long)rxErrBarramento);
-  }
 
   if (status.state == TWAI_STATE_BUS_OFF) {
     LOGLN("[CAN] BUS-OFF detectado. Iniciando recuperacao...");
@@ -345,9 +292,6 @@ void imprimirTemperatura(const char* nome, float valor) {
   else LOGF("%s: SEM LEITURA\n", nome);
 }
 
-// Usada pelas duas placas de termopares (0x100 e 0x300), que tem o mesmo
-// formato de quadro. Cada uma grava no seu proprio vetor.
-// O site separa as duas pelo titulo do bloco ("TEMPERATURAS" ou "TEMP. INTERNAS").
 void receberQuadroTemperaturas(const twai_message_t &mensagem,
                                float destino[11],
                                uint32_t &ultimaMensagem,
@@ -400,12 +344,6 @@ void receberTemperatura(const twai_message_t &mensagem) {
                             "TEMPERATURAS");
 }
 
-void receberTemperaturaInterna(const twai_message_t &mensagem) {
-  receberQuadroTemperaturas(mensagem, temperaturasInternas,
-                            ultimaMensagemTempInterna,
-                            desconexaoTempInternaInformada,
-                            "TEMP. INTERNAS");
-}
 
 // ============================ RECEPCAO AQUECIMENTO ==========================
 void receberAquecimento(const twai_message_t &mensagem) {
@@ -428,7 +366,7 @@ void receberAquecimento(const twai_message_t &mensagem) {
       (uint16_t)mensagem.data[5] |
       ((uint16_t)mensagem.data[6] << 8);
 
-    temperaturaReator = (temperaturaRaw == INT16_MIN) ? NAN : temperaturaRaw / 100.0f;
+    temperaturaReator = (temperaturaRaw == INT16_MIN) ? NAN : temperaturaRaw / ESCALA_TEMP_REATOR;
     tensao   = (tensaoRaw   == UINT16_MAX) ? NAN : tensaoRaw / 10.0f;
     corrente = (correnteRaw == UINT16_MAX) ? NAN : correnteRaw / 1000.0f;
 
@@ -436,7 +374,7 @@ void receberAquecimento(const twai_message_t &mensagem) {
     desconexaoInformada = false;
 
     LOGLN("\n========== AQUECIMENTO / MEDIDAS ==========");
-    if (!isnan(temperaturaReator)) LOGF("Temperatura do reator: %.2f C\n", temperaturaReator);
+    if (!isnan(temperaturaReator)) LOGF("Temperatura do reator: %.1f C\n", temperaturaReator);
     else LOGLN("Temperatura do reator: SEM LEITURA");
 
     if (!isnan(tensao)) LOGF("Tensao: %.1f V\n", tensao);
@@ -544,37 +482,11 @@ void processarMensagensCAN() {
     switch (mensagem.identifier) {
       case CAN_ID_TEMPERATURA: receberTemperatura(mensagem); break;
       case CAN_ID_AQUECIMENTO: receberAquecimento(mensagem); break;
-      case CAN_ID_TEMP_INTERNA: receberTemperaturaInterna(mensagem); break;
       case CAN_ID_MASSA:       receberMassa(mensagem);       break;
       case CAN_ID_QUEIMAGAS:   receberQueimagas(mensagem);   break;
-      default:
-        // Qualquer outro ID (ex.: 0x123 de outra placa de teste)
-        LOGF("RX id=0x%X dado=%d\n", (unsigned)mensagem.identifier,
-             mensagem.data_length_code > 0 ? mensagem.data[0] : 0);
-        break;
+      default: break;
     }
   }
-}
-
-// Quadro de teste do barramento (so quando ENVIAR_TESTE = true)
-void enviarTeste() {
-  if (!ENVIAR_TESTE || !canOk) return;
-
-  static uint8_t contador = 0;
-  static uint32_t ultimoEnvio = 0;
-  uint32_t agora = millis();
-  if (agora - ultimoEnvio < INTERVALO_TX_MS) return;
-  ultimoEnvio = agora;
-
-  twai_message_t m = {};
-  m.identifier = CAN_ID_TESTE;
-  m.data_length_code = 1;
-  m.data[0] = contador++;
-
-  // sem espera: a recepcao das escravas nao para enquanto o quadro sai
-  esp_err_t resultado = twai_transmit(&m, 0);
-  LOGF("TX: %s\n", esp_err_to_name(resultado));
-  (void)resultado;  // no modo JSON o LOGF nao imprime
 }
 
 // ============================== MONITOR =====================================
@@ -597,8 +509,6 @@ void monitorarConexaoCAN() {
     "[CAN] ATENCAO: sem comunicacao com a escrava Temperatura (ID 0x100).", agora);
   verificarTimeout(ultimaMensagemAquecimento, desconexaoInformada,
     "[CAN] ATENCAO: sem comunicacao com a escrava de aquecimento (ID 0x200).", agora);
-  verificarTimeout(ultimaMensagemTempInterna, desconexaoTempInternaInformada,
-    "[CAN] ATENCAO: sem comunicacao com a escrava Temp. internas (ID 0x300).", agora);
   verificarTimeout(ultimaMensagemMassa, desconexaoMassaInformada,
     "[CAN] ATENCAO: sem comunicacao com a escrava da Balanca (ID 0x500).", agora);
   verificarTimeout(ultimaMensagemQueimagas, desconexaoQueimagasInformada,
@@ -626,7 +536,6 @@ void setup() {
 // ================================= LOOP ===================================
 void loop() {
   processarMensagensCAN();
-  enviarTeste();
   verificarBarramentoCAN();
   monitorarConexaoCAN();
   enviarJsonSerial();
