@@ -2,7 +2,6 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
-  Power,
   Thermometer,
   Wind,
   Gauge,
@@ -59,7 +58,6 @@ const BAUD_RATE = 115200;
 // Unidades de cada sensor, agrupadas pela escrava que envia o dado.
 //   Temperatura (ID 0x100): T1 a T10 (MAX6675) e DHT22
 //   Aquecimento (ID 0x200): temperatura do reator, tensão, corrente e energia
-//   Temp. internas (ID 0x300): T1 a T10 e DHT22 internos (i1..i10, idht22 no site)
 //   Balança     (ID 0x500): massa do bio-óleo
 //   Queimagas   (ID 0x600): temperatura da água, presença de gás e de chama, calor
 // Nitrogênio e volume do gás ainda não têm escrava (aparecem como "—").
@@ -75,17 +73,6 @@ const UNIDADES = {
   t9: "°C",
   t10: "°C",
   dht22: "°C",
-  i1: "°C",
-  i2: "°C",
-  i3: "°C",
-  i4: "°C",
-  i5: "°C",
-  i6: "°C",
-  i7: "°C",
-  i8: "°C",
-  i9: "°C",
-  i10: "°C",
-  idht22: "°C",
   temperatura: "°C",
   tensao: "V",
   corrente: "A",
@@ -110,23 +97,7 @@ const TERMOPARES: { sensor: SensorName; rotulo: string }[] = [
   { sensor: "dht22", rotulo: "DHT22" },
 ];
 
-// Mesma placa de termopares, mas a da escrava 0x300 (temperaturas internas)
-const TERMOPARES_INTERNOS: { sensor: SensorName; rotulo: string }[] = [
-  ...Array.from({ length: 10 }, (_, i) => ({
-    sensor: `i${i + 1}` as SensorName,
-    rotulo: `T${i + 1}`,
-  })),
-  { sensor: "idht22", rotulo: "DHT22" },
-];
-
-// "T3" de um bloco "TEMP. INTERNAS" -> "i3"
-const PARA_INTERNO = Object.fromEntries(
-  TERMOPARES.map(({ sensor }, i) => [sensor, TERMOPARES_INTERNOS[i].sensor]),
-) as Record<string, SensorName>;
-
-const TODOS_TERMOPARES = [...TERMOPARES, ...TERMOPARES_INTERNOS];
-
-type Escrava = "temperatura" | "tempInterna" | "aquecimento" | "balanca" | "queimagas";
+type Escrava = "temperatura" | "aquecimento" | "balanca" | "queimagas";
 
 // Texto que a mestra imprime antes do ":" em cada linha -> sensor no site e escrava de origem.
 // Ex.: "T3: 251.2 C", "Tensao: SEM LEITURA", "Presenca de chama: Sim", "Calor: 1200 J"
@@ -149,7 +120,6 @@ const ROTULOS_SERIAL: Record<string, { sensor: SensorName; escrava: Escrava }> =
 const ID_ESCRAVA: Record<string, Escrava> = {
   "0x100": "temperatura",
   "0x200": "aquecimento",
-  "0x300": "tempInterna",
   "0x500": "balanca",
   "0x600": "queimagas",
 };
@@ -172,9 +142,7 @@ const ESTADOS_TWAI: Record<number, { texto: string; ok: boolean }> = {
 };
 
 // Interpreta uma linha da saída serial da mestra. Linhas desconhecidas são ignoradas.
-// As escravas 0x100 e 0x300 imprimem os mesmos rótulos (T1..T10, DHT22); quem diz de
-// qual delas é a linha é o título do bloco anterior ("TEMPERATURAS" ou "TEMP. INTERNAS").
-function lerLinha(linha: string, blocoInterno = false): EventoSerial | null {
+function lerLinha(linha: string): EventoSerial | null {
   if (linha.includes("ATENCAO: sem comunicacao")) {
     const id = linha.match(/ID (0x[0-9A-Fa-f]+)/)?.[1]?.toLowerCase();
     const escrava = id ? ID_ESCRAVA[id] : undefined;
@@ -197,12 +165,8 @@ function lerLinha(linha: string, blocoInterno = false): EventoSerial | null {
   if (rx) return { tipo: "rx", id: rx[1].toUpperCase().replace("0X", "0x"), dado: +rx[2] };
   const m = linha.match(/^([^:]+):\s*(.+)$/);
   if (!m) return null;
-  const rotulo = ROTULOS_SERIAL[m[1].trim()];
-  if (!rotulo) return null;
-  const destino =
-    blocoInterno && rotulo.escrava === "temperatura"
-      ? { sensor: PARA_INTERNO[rotulo.sensor], escrava: "tempInterna" as Escrava }
-      : rotulo;
+  const destino = ROTULOS_SERIAL[m[1].trim()];
+  if (!destino) return null;
   const texto = m[2].trim();
   // "Sim"/"Nao" da Queimagas viram 1/0 (aceita também "Yes"/"No" da mestra antiga);
   // "SEM LEITURA" e "DADO INVALIDO" ficam sem valor
@@ -221,11 +185,6 @@ type JsonMestra = {
   can_ok?: boolean;
   barramento?: { estado: number | null; tx_err: number; rx_err: number };
   temperatura?: { online: boolean; termopares?: (number | null)[]; dht22?: number | null };
-  temperatura_interna?: {
-    online: boolean;
-    termopares?: (number | null)[];
-    dht22?: number | null;
-  };
   aquecimento?: {
     online: boolean;
     temperatura_reator?: number | null;
@@ -280,13 +239,6 @@ function lerJson(linha: string): EventoSerial[] {
     ),
     ["dht22", num(t?.dht22)],
   ]);
-  const ti = d.temperatura_interna;
-  grupo("tempInterna", ti?.online, [
-    ...TERMOPARES_INTERNOS.slice(0, 10).map(
-      ({ sensor }, i) => [sensor, num(ti?.termopares?.[i])] as [SensorName, number | null],
-    ),
-    ["idht22", num(ti?.dht22)],
-  ]);
   const a = d.aquecimento;
   grupo("aquecimento", a?.online, [
     ["temperatura", num(a?.temperatura_reator)],
@@ -325,7 +277,17 @@ function pushSeries(series: Point[], v: number, t: number): Point[] {
 
 // Histórico completo dos termopares durante o ensaio (gráfico temperatura × tempo).
 // Uma linha por segundo; cada termopar entra na linha do segundo em que chegou.
-type LinhaHistorico = { t: number } & Partial<Record<SensorName, number>>;
+type LinhaHistorico = { t: number; potencia?: number; energiaWh?: number } & Partial<
+  Record<SensorName, number>
+>;
+
+// Temperatura interna do reator (escrava Aquecimento 0x200)
+const TEMP_INTERNA: { sensor: SensorName; rotulo: string }[] = [
+  { sensor: "temperatura", rotulo: "Reator" },
+];
+
+// Tudo que vai para o histórico do ensaio (gráficos e CSV)
+const SERIES_HISTORICO = [...TERMOPARES, ...TEMP_INTERNA];
 const MAX_PONTOS_GRAFICO = 600; // acima disso o gráfico mostra médias por intervalo
 
 const CORES_TERMOPARES = [
@@ -351,11 +313,19 @@ function reduzirHistorico(linhas: LinhaHistorico[]): LinhaHistorico[] {
   for (let i = 0; i < linhas.length; i += passo) {
     const grupo = linhas.slice(i, i + passo);
     const media: LinhaHistorico = { t: grupo[0].t };
-    for (const { sensor } of TODOS_TERMOPARES) {
-      const vals = grupo.map((l) => l[sensor]).filter((v): v is number => v !== undefined);
-      if (vals.length)
-        media[sensor] = Number((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2));
+    const mediaDe = (vals: (number | undefined)[]) => {
+      const ok = vals.filter((v): v is number => v !== undefined);
+      return ok.length ? Number((ok.reduce((a, b) => a + b, 0) / ok.length).toFixed(2)) : undefined;
+    };
+    for (const { sensor } of SERIES_HISTORICO) {
+      const v = mediaDe(grupo.map((l) => l[sensor]));
+      if (v !== undefined) media[sensor] = v;
     }
+    const pot = mediaDe(grupo.map((l) => l.potencia));
+    if (pot !== undefined) media.potencia = pot;
+    // energia é acumulada: fica o último valor do intervalo
+    const energias = grupo.map((l) => l.energiaWh).filter((v): v is number => v !== undefined);
+    if (energias.length) media.energiaWh = energias[energias.length - 1];
     saida.push(media);
   }
   return saida;
@@ -381,7 +351,6 @@ function simNao(n: number | null) {
 type ConnStatus = "desconectado" | "conectando" | "conectado" | "simulacao";
 
 function Dashboard() {
-  const [setpoint, setSetpoint] = useState(420);
   const [now, setNow] = useState(new Date());
   const [elapsed, setElapsed] = useState(0);
   const [conn, setConn] = useState<ConnStatus>("desconectado");
@@ -410,7 +379,6 @@ function Dashboard() {
   const [escravaOnline, setEscravaOnline] = useState<Record<Escrava, boolean | null>>({
     temperatura: null,
     aquecimento: null,
-    tempInterna: null,
     balanca: null,
     queimagas: null,
   });
@@ -419,14 +387,14 @@ function Dashboard() {
   const leitorRef = useRef<ReadableStreamDefaultReader<string> | null>(null);
   const simulacaoRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startRef = useRef(Date.now());
-  // true enquanto a mestra imprime um bloco "TEMP. INTERNAS" (escrava 0x300)
-  const blocoInternoRef = useRef(false);
   // histórico dos termopares desde o início do ensaio (null = ainda não chegou nada)
   const historicoRef = useRef<LinhaHistorico[]>([]);
+  const ultimaTensaoRef = useRef<number | null>(null);
+  const ultimaCorrenteRef = useRef<number | null>(null);
   const inicioEnsaioRef = useRef<number | null>(null);
   const [visiveis, setVisiveis] = useState<Record<SensorName, boolean>>(
     () =>
-      Object.fromEntries(TODOS_TERMOPARES.map(({ sensor }) => [sensor, true])) as Record<
+      Object.fromEntries(SERIES_HISTORICO.map(({ sensor }) => [sensor, true])) as Record<
         SensorName,
         boolean
       >,
@@ -458,12 +426,7 @@ function Dashboard() {
       lerJson(texto).forEach(processarEvento);
       return;
     }
-    // título de bloco: "========== TEMP. INTERNAS / QUADRO 2 =========="
-    if (texto.startsWith("=====") && /[A-Z]/.test(texto)) {
-      blocoInternoRef.current = texto.includes("INTERNAS");
-      return;
-    }
-    const evento = lerLinha(texto, blocoInternoRef.current);
+    const evento = lerLinha(texto);
     if (evento) processarEvento(evento);
   };
 
@@ -500,12 +463,20 @@ function Dashboard() {
     if (valor !== null) {
       const t = Math.round((Date.now() - startRef.current) / 1000);
       setSeries((s) => ({ ...s, [sensor]: pushSeries(s[sensor], valor, t) }));
-      if (escrava === "temperatura" || escrava === "tempInterna") registrarHistorico(sensor, valor);
+      if (escrava === "temperatura" || sensor === "temperatura") registrarHistorico(sensor, valor);
+      // potência = tensão × corrente (W) e energia acumulada em Wh
+      if (sensor === "tensao") ultimaTensaoRef.current = valor;
+      if (sensor === "corrente") {
+        ultimaCorrenteRef.current = valor;
+        if (ultimaTensaoRef.current !== null)
+          registrarHistorico("potencia", Number((ultimaTensaoRef.current * valor).toFixed(1)));
+      }
+      if (sensor === "energia") registrarHistorico("energiaWh", Number((valor * 1000).toFixed(1)));
     }
     setLastUpdate(new Date());
   };
 
-  function registrarHistorico(sensor: SensorName, valor: number) {
+  function registrarHistorico(sensor: SensorName | "potencia" | "energiaWh", valor: number) {
     const agora = Date.now();
     if (inicioEnsaioRef.current === null) inicioEnsaioRef.current = agora;
     const t = Math.round((agora - inicioEnsaioRef.current) / 1000);
@@ -529,19 +500,20 @@ function Dashboard() {
     const cab = [
       "tempo_s",
       ...TERMOPARES.map(({ rotulo }) => `ext_${rotulo}_C`),
-      ...TERMOPARES_INTERNOS.map(({ rotulo }) => `int_${rotulo}_C`),
+      "reator_C",
+      "potencia_W",
+      "energia_Wh",
     ].join(";");
     const linhas = historicoRef.current.map((l) =>
-      [
-        l.t,
-        ...TODOS_TERMOPARES.map(({ sensor }) => (l[sensor] ?? "").toString().replace(".", ",")),
-      ].join(";"),
+      [l.t, ...SERIES_HISTORICO.map(({ sensor }) => l[sensor]), l.potencia, l.energiaWh]
+        .map((v) => (v ?? "").toString().replace(".", ","))
+        .join(";"),
     );
     const blob = new Blob([[cab, ...linhas].join("\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `termopares_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+    a.download = `ensaio_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -638,12 +610,6 @@ function Dashboard() {
     }
   };
 
-  // a simulação lê o setpoint atual sem reiniciar o intervalo
-  const setpointRef = useRef(setpoint);
-  useEffect(() => {
-    setpointRef.current = setpoint;
-  }, [setpoint]);
-
   // Modo simulação: gera as mesmas linhas que a mestra imprime, para testar sem a placa
   const iniciarSimulacao = async () => {
     await desconectar();
@@ -664,7 +630,7 @@ function Dashboard() {
       processarLinha(v === null ? `${rotulo}: SEM LEITURA` : `${rotulo}: ${v.toFixed(1)} C`);
     simulacaoRef.current = setInterval(() => {
       t += 1;
-      const sp = setpointRef.current;
+      const sp = 450; // temperatura que a simulação persegue
       temperatura += (sp - temperatura) * 0.05 + (Math.random() - 0.5) * 3;
 
       // Escrava Aquecimento (ID 0x200)
@@ -691,20 +657,6 @@ function Dashboard() {
         linhaTemp("T10", perfil(9));
         linhaTemp("DHT22", 27 + Math.random());
       }
-
-      // Escrava Temp. internas (ID 0x300): mesmo formato, valores um pouco acima das externas
-      processarLinha(`========== TEMP. INTERNAS / QUADRO ${quadro} ==========`);
-      const interno = (i: number) => perfil(i) * 1.15 + 5;
-      if (quadro < 4) {
-        for (let i = 0; i < 3; i++) {
-          const n = (quadro - 1) * 3 + i + 1;
-          linhaTemp(`T${n}`, interno(n - 1));
-        }
-      } else {
-        linhaTemp("T10", interno(9));
-        linhaTemp("DHT22", 30 + Math.random());
-      }
-      processarLinha("==============================================");
 
       // Escrava Queimagas (ID 0x600)
       const quente = temperatura > 300;
@@ -807,7 +759,7 @@ function Dashboard() {
         </div>
       </header>
 
-      {/* CONEXÃO + SETPOINT */}
+      {/* CONEXÃO + TELEMETRIA */}
       <section className="mb-6 grid gap-4 lg:grid-cols-[1.2fr_1fr]">
         <div className="rounded-2xl panel-grad border border-border p-5">
           <SectionTitle icon={<Usb className="h-4 w-4" />} label="Conexão com a ESP32 Mestra" />
@@ -884,47 +836,6 @@ function Dashboard() {
               </div>
             </div>
           )}
-
-          <div className="mt-6 border-t border-border pt-5">
-            <div className="flex items-baseline justify-between">
-              <label className="text-xs uppercase tracking-widest text-muted-foreground">
-                Setpoint · Referência no gráfico
-              </label>
-              <span className="text-mono text-3xl text-neon">
-                {setpoint}
-                <span className="ml-1 text-sm text-muted-foreground">°C</span>
-              </span>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={600}
-              step={5}
-              value={setpoint}
-              onChange={(e) => setSetpoint(Number(e.target.value))}
-              className="mt-3 w-full accent-[color:var(--neon)]"
-            />
-            <div className="mt-1 flex justify-between text-[10px] text-muted-foreground text-mono">
-              <span>0°C</span>
-              <span>300°C</span>
-              <span>600°C</span>
-            </div>
-            <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs">
-              {[300, 420, 550].map((p) => (
-                <button
-                  key={p}
-                  onClick={() => setSetpoint(p)}
-                  className="rounded-lg border border-border bg-background/40 py-2 text-mono hover:border-neon hover:text-neon transition"
-                >
-                  {p}°C
-                </button>
-              ))}
-            </div>
-            <p className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
-              <Power className="h-3.5 w-3.5" />A mestra atual só envia leituras. Ligar/desligar e o
-              setpoint ainda não são enviados ao reator.
-            </p>
-          </div>
         </div>
 
         <div className="rounded-2xl panel-grad border border-border p-5">
@@ -968,178 +879,12 @@ function Dashboard() {
 
       {/* SUBGROUPS */}
       <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {/* GRUPO 2 */}
-        <Card tag="Grupo 2" title="Fluxo de Nitrogênio" icon={<Wind className="h-4 w-4" />}>
-          <Metric
-            icon={<Wind className="h-4 w-4 text-cyan" />}
-            label="Nitrogênio"
-            value={fmt(valores.nitrogenio, 2)}
-            unit={UNIDADES.nitrogenio}
-          />
-          <Spark data={series.nitrogenio} color="var(--cyan)" />
-        </Card>
-
-        {/* TEMPERATURAS (ID 0x100) */}
-        <Card
-          tag="Escrava Temperatura · ID 0x100"
-          title="Temperaturas Externas"
-          icon={<Thermometer className="h-4 w-4" />}
-          className="md:col-span-2"
-        >
-          <AvisoOffline online={escravaOnline.temperatura} nome="Temperatura" />
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-6">
-            {TERMOPARES.map(({ sensor, rotulo }) => (
-              <Metric
-                key={sensor}
-                icon={<Thermometer className="h-4 w-4 text-neon" />}
-                label={rotulo}
-                value={fmt(valores[sensor], 1)}
-                unit={UNIDADES[sensor]}
-                compact
-              />
-            ))}
-          </div>
-        </Card>
-
-        {/* TEMPERATURAS INTERNAS (ID 0x300) */}
-        <Card
-          tag="Escrava Temp. internas · ID 0x300"
-          title="Temperaturas Internas"
-          icon={<Thermometer className="h-4 w-4" />}
-          className="md:col-span-2"
-        >
-          <AvisoOffline online={escravaOnline.tempInterna} nome="Temp. internas" />
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-6">
-            {TERMOPARES_INTERNOS.map(({ sensor, rotulo }) => (
-              <Metric
-                key={sensor}
-                icon={<Thermometer className="h-4 w-4 text-cyan" />}
-                label={rotulo}
-                value={fmt(valores[sensor], 1)}
-                unit={UNIDADES[sensor]}
-                compact
-              />
-            ))}
-          </div>
-        </Card>
-
-        {/* GRÁFICOS TEMPERATURA × TEMPO (ensaio inteiro): externas (0x100) e internas (0x300) */}
-        <GraficoTemperaturas
-          tag="Escrava Temperatura · ID 0x100"
-          titulo="Temperaturas Externas × Tempo"
-          nomeEscrava="Temperatura"
-          lista={TERMOPARES}
-          dados={historicoGrafico}
-          duracao={duracaoEnsaio}
-          leituras={historicoRef.current.length}
-          visiveis={visiveis}
-          alternar={alternarCurva}
-          baixarCsv={baixarCsv}
-          novoEnsaio={zerarHistorico}
-        />
-        <GraficoTemperaturas
-          tag="Escrava Temp. internas · ID 0x300"
-          titulo="Temperaturas Internas × Tempo"
-          nomeEscrava="Temp. internas"
-          lista={TERMOPARES_INTERNOS}
-          dados={historicoGrafico}
-          duracao={duracaoEnsaio}
-          leituras={historicoRef.current.length}
-          visiveis={visiveis}
-          alternar={alternarCurva}
-          baixarCsv={baixarCsv}
-          novoEnsaio={zerarHistorico}
-        />
-
-        {/* QUEIMAGAS (ID 0x600) */}
-        <Card
-          tag="Escrava Queimagas · ID 0x600"
-          title="Queima e Segurança"
-          icon={<Flame className="h-4 w-4" />}
-        >
-          <AvisoOffline online={escravaOnline.queimagas} nome="Queimagas" />
-          {gasSemChama ? (
-            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs font-semibold text-danger">
-              <AlertTriangle className="h-4 w-4 shrink-0" />
-              Estado: Perigo, há gás mas não há chama
-            </div>
-          ) : valores.presencaGas !== null && valores.presencaChama !== null ? (
-            <div className="flex items-center gap-2 rounded-xl border border-neon/40 bg-neon/10 px-4 py-2.5 text-xs font-semibold text-neon">
-              <CheckCircle2 className="h-4 w-4 shrink-0" />
-              Estado: Estável
-            </div>
-          ) : null}
-          <div className="grid grid-cols-2 gap-3">
-            <Metric
-              icon={<Droplets className="h-4 w-4 text-cyan" />}
-              label="Temp. Água"
-              value={fmt(valores.temperaturaAgua, 1)}
-              unit={UNIDADES.temperaturaAgua}
-              compact
-            />
-            <Metric
-              icon={<Flame className="h-4 w-4 text-warn" />}
-              label="Calor"
-              value={fmt(valores.calor, 0)}
-              unit={UNIDADES.calor}
-              compact
-              tone="warn"
-            />
-          </div>
-          <SimNaoBadge label="Presença de gás" valor={valores.presencaGas} />
-          <SimNaoBadge label="Presença de chama" valor={valores.presencaChama} />
-        </Card>
-
-        {/* GRUPO 4 */}
-        <Card tag="Grupo 4" title="Fluxo de Gases" icon={<Wind className="h-4 w-4" />}>
-          <Metric
-            icon={<CircleDot className="h-4 w-4 text-neon" />}
-            label="Volume do Gás"
-            value={fmt(valores.volumeGas, 2)}
-            unit={UNIDADES.volumeGas}
-          />
-          <div className="h-44">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart
-                data={series.volumeGas}
-                margin={{ top: 5, right: 5, left: -20, bottom: 0 }}
-              >
-                <defs>
-                  <linearGradient id="gPyro" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="var(--neon)" stopOpacity={0.7} />
-                    <stop offset="100%" stopColor="var(--neon)" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
-                <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
-                <Tooltip
-                  contentStyle={{
-                    background: "var(--popover)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 8,
-                    fontSize: 12,
-                  }}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="v"
-                  stroke="var(--neon)"
-                  strokeWidth={2}
-                  fill="url(#gPyro)"
-                  isAnimationActive={false}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
-
         {/* GRUPO 6 */}
         <Card
           tag="Grupo 6 · Escrava Aquecimento · ID 0x200"
           title="Eficiência Energética e Aquecimento"
           icon={<Zap className="h-4 w-4" />}
-          className="md:col-span-2"
+          className="md:col-span-2 xl:col-span-3"
         >
           <AvisoOffline online={escravaOnline.aquecimento} nome="Aquecimento" />
           <div className="grid gap-3 sm:grid-cols-3">
@@ -1189,53 +934,96 @@ function Dashboard() {
               mono
             />
           </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart
-                data={series.temperatura}
-                margin={{ top: 10, right: 10, left: -15, bottom: 0 }}
-              >
-                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
-                <YAxis domain={[0, 650]} tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
-                <Tooltip
-                  contentStyle={{
-                    background: "var(--popover)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 8,
-                    fontSize: 12,
-                  }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="v"
-                  stroke="var(--neon)"
-                  strokeWidth={2.5}
-                  dot={false}
-                  isAnimationActive={false}
-                />
-                {/* setpoint reference */}
-                <Line
-                  type="monotone"
-                  dataKey={() => setpoint}
-                  data={series.temperatura}
-                  stroke="var(--cyan)"
-                  strokeDasharray="4 4"
-                  strokeWidth={1.5}
-                  dot={false}
-                  isAnimationActive={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+          <GraficoPotencia dados={historicoGrafico} />
+        </Card>
+
+        {/* TEMPERATURAS (ID 0x100) */}
+        <Card
+          tag="Escrava Temperatura · ID 0x100"
+          title="Temperaturas Externas"
+          icon={<Thermometer className="h-4 w-4" />}
+          className="md:col-span-2 xl:col-span-3"
+        >
+          <AvisoOffline online={escravaOnline.temperatura} nome="Temperatura" />
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-6">
+            {TERMOPARES.map(({ sensor, rotulo }) => (
+              <Metric
+                key={sensor}
+                icon={<Thermometer className="h-4 w-4 text-neon" />}
+                label={rotulo}
+                value={fmt(valores[sensor], 1)}
+                unit={UNIDADES[sensor]}
+                compact
+              />
+            ))}
           </div>
-          <div className="flex items-center gap-4 text-xs text-muted-foreground">
-            <span className="inline-flex items-center gap-2">
-              <span className="inline-block h-2 w-4 rounded bg-neon" /> Temperatura
-            </span>
-            <span className="inline-flex items-center gap-2">
-              <span className="inline-block h-2 w-4 rounded bg-cyan" /> Setpoint
-            </span>
+        </Card>
+
+        {/* GRÁFICOS TEMPERATURA × TEMPO (ensaio inteiro): externas (0x100) e interna do reator (0x200) */}
+        <GraficoTemperaturas
+          tag="Escrava Temperatura · ID 0x100"
+          titulo="Temperaturas Externas × Tempo"
+          nomeEscrava="Temperatura"
+          lista={TERMOPARES}
+          dados={historicoGrafico}
+          duracao={duracaoEnsaio}
+          leituras={historicoRef.current.length}
+          visiveis={visiveis}
+          alternar={alternarCurva}
+          baixarCsv={baixarCsv}
+          novoEnsaio={zerarHistorico}
+        />
+        <GraficoTemperaturas
+          tag="Escrava Aquecimento · ID 0x200"
+          titulo="Temperatura Interna × Tempo"
+          nomeEscrava="Aquecimento"
+          lista={TEMP_INTERNA}
+          dados={historicoGrafico}
+          duracao={duracaoEnsaio}
+          leituras={historicoRef.current.length}
+          visiveis={visiveis}
+          alternar={alternarCurva}
+          baixarCsv={baixarCsv}
+          novoEnsaio={zerarHistorico}
+        />
+
+        {/* QUEIMAGAS (ID 0x600) */}
+        <Card
+          tag="Escrava Queimagas · ID 0x600"
+          title="Queima e Segurança"
+          icon={<Flame className="h-4 w-4" />}
+        >
+          <AvisoOffline online={escravaOnline.queimagas} nome="Queimagas" />
+          {gasSemChama ? (
+            <div className="flex items-center gap-2 rounded-xl border border-danger/50 bg-danger/10 px-4 py-2.5 text-xs font-semibold text-danger">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              Estado: Perigo, há gás mas não há chama
+            </div>
+          ) : valores.presencaGas !== null && valores.presencaChama !== null ? (
+            <div className="flex items-center gap-2 rounded-xl border border-neon/40 bg-neon/10 px-4 py-2.5 text-xs font-semibold text-neon">
+              <CheckCircle2 className="h-4 w-4 shrink-0" />
+              Estado: Estável
+            </div>
+          ) : null}
+          <div className="grid grid-cols-2 gap-3">
+            <Metric
+              icon={<Droplets className="h-4 w-4 text-cyan" />}
+              label="Temp. Água"
+              value={fmt(valores.temperaturaAgua, 1)}
+              unit={UNIDADES.temperaturaAgua}
+              compact
+            />
+            <Metric
+              icon={<Flame className="h-4 w-4 text-warn" />}
+              label="Calor"
+              value={fmt(valores.calor, 0)}
+              unit={UNIDADES.calor}
+              compact
+              tone="warn"
+            />
           </div>
+          <SimNaoBadge label="Presença de gás" valor={valores.presencaGas} />
+          <SimNaoBadge label="Presença de chama" valor={valores.presencaChama} />
         </Card>
 
         {/* GRUPO 8 */}
@@ -1280,6 +1068,60 @@ function Dashboard() {
                   stroke="var(--warn)"
                   strokeWidth={2}
                   fill="url(#gBio)"
+                  isAnimationActive={false}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        </Card>
+        {/* GRUPO 2 */}
+        <Card tag="Grupo 2" title="Fluxo de Nitrogênio" icon={<Wind className="h-4 w-4" />}>
+          <Metric
+            icon={<Wind className="h-4 w-4 text-cyan" />}
+            label="Nitrogênio"
+            value={fmt(valores.nitrogenio, 2)}
+            unit={UNIDADES.nitrogenio}
+          />
+          <Spark data={series.nitrogenio} color="var(--cyan)" />
+        </Card>
+
+        {/* GRUPO 4 */}
+        <Card tag="Grupo 4" title="Fluxo de Gases" icon={<Wind className="h-4 w-4" />}>
+          <Metric
+            icon={<CircleDot className="h-4 w-4 text-neon" />}
+            label="Volume do Gás"
+            value={fmt(valores.volumeGas, 2)}
+            unit={UNIDADES.volumeGas}
+          />
+          <div className="h-44">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart
+                data={series.volumeGas}
+                margin={{ top: 5, right: 5, left: -20, bottom: 0 }}
+              >
+                <defs>
+                  <linearGradient id="gPyro" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="var(--neon)" stopOpacity={0.7} />
+                    <stop offset="100%" stopColor="var(--neon)" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
+                <YAxis tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} />
+                <Tooltip
+                  contentStyle={{
+                    background: "var(--popover)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    fontSize: 12,
+                  }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="v"
+                  stroke="var(--neon)"
+                  strokeWidth={2}
+                  fill="url(#gPyro)"
                   isAnimationActive={false}
                 />
               </AreaChart>
@@ -1428,6 +1270,91 @@ function GraficoTemperaturas({
         )}
       </div>
     </Card>
+  );
+}
+
+// Potência (W) e energia acumulada (Wh) do aquecimento ao longo do ensaio
+function GraficoPotencia({ dados }: { dados: LinhaHistorico[] }) {
+  const temDados = dados.some((l) => l.potencia !== undefined || l.energiaWh !== undefined);
+  return (
+    <div>
+      <div className="mb-2 flex items-center gap-4 text-xs text-muted-foreground">
+        <span className="uppercase tracking-widest">Potência e energia × tempo</span>
+        <span className="inline-flex items-center gap-2">
+          <span className="inline-block h-2 w-4 rounded bg-warn" /> Potência (W)
+        </span>
+        <span className="inline-flex items-center gap-2">
+          <span className="inline-block h-2 w-4 rounded bg-cyan" /> Energia (Wh)
+        </span>
+      </div>
+      <div className="h-64">
+        {temDados ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={dados} margin={{ top: 10, right: 0, left: -5, bottom: 0 }}>
+              <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="t"
+                type="number"
+                domain={["dataMin", "dataMax"]}
+                tickFormatter={fmtTempo}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+              />
+              <YAxis
+                yAxisId="w"
+                unit=" W"
+                width={65}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+              />
+              <YAxis
+                yAxisId="wh"
+                orientation="right"
+                unit=" Wh"
+                width={70}
+                tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
+              />
+              <Tooltip
+                labelFormatter={(t) => `Tempo ${fmtTempo(Number(t))}`}
+                formatter={(v, nome) =>
+                  nome === "Potência" ? `${Number(v).toFixed(0)} W` : `${Number(v).toFixed(1)} Wh`
+                }
+                contentStyle={{
+                  background: "var(--popover)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  fontSize: 12,
+                }}
+              />
+              <Line
+                yAxisId="w"
+                type="monotone"
+                dataKey="potencia"
+                name="Potência"
+                stroke="var(--warn)"
+                strokeWidth={2}
+                dot={false}
+                connectNulls
+                isAnimationActive={false}
+              />
+              <Line
+                yAxisId="wh"
+                type="stepAfter"
+                dataKey="energiaWh"
+                name="Energia"
+                stroke="var(--cyan)"
+                strokeWidth={2}
+                dot={false}
+                connectNulls
+                isAnimationActive={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <div className="grid h-full place-items-center text-xs text-muted-foreground">
+            O gráfico começa quando a escrava Aquecimento enviar tensão e corrente.
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
